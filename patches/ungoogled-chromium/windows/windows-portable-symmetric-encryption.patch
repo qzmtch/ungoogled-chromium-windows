@@ -1,0 +1,92 @@
+--- a/components/os_crypt/sync/os_crypt_win.cc
++++ b/components/os_crypt/sync/os_crypt_win.cc
+@@ -12,6 +12,8 @@
+ #include "base/logging.h"
+ #include "base/memory/singleton.h"
+ #include "base/metrics/histogram_functions.h"
++#include "crypto/symmetric_key.h"
++#include "crypto/encryptor.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+@@ -126,6 +128,42 @@ bool EncryptAndStoreKey(const std::string& key, PrefService* local_state) {
+   return true;
+ }
+ 
++// Portable symmetric encryption
++crypto::Encryptor* GetPortableEncryptor() {
++  static bool initialized = false;
++  static std::unique_ptr<crypto::SymmetricKey> symmetric_key;
++  static std::unique_ptr<crypto::Encryptor> encryptor;
++
++  if (!initialized) {
++    initialized = true;
++    
++    // Fixed key for portable mode (16 characters for AES-128)
++    const std::string kPortableKey = "ungoogled-chrome";
++    const std::string kPortableIV = "1122334455667788";
++    
++    symmetric_key = crypto::SymmetricKey::Import(
++        crypto::SymmetricKey::AES, kPortableKey);
++    
++    if (symmetric_key) {
++      encryptor = std::make_unique<crypto::Encryptor>();
++      if (!encryptor->Init(symmetric_key.get(), 
++                          crypto::Encryptor::CBC, 
++                          kPortableIV)) {
++        encryptor.reset();
++        symmetric_key.reset();
++      }
++    }
++  }
++
++  return encryptor.get();
++}
++
++// Prefix for portable encrypted data
++constexpr char kPortableEncryptionPrefix[] = "p10";
++
++bool IsPortableEncrypted(const std::string& ciphertext) {
++  return base::StartsWith(ciphertext, kPortableEncryptionPrefix, base::CompareCase::SENSITIVE);
++}
++
+ }  // namespace
+ 
+ namespace OSCrypt {
+@@ -199,6 +237,18 @@ bool OSCryptImpl::DecryptString16(const std::string& ciphertext,
+ 
+ bool OSCryptImpl::EncryptString(const std::string& plaintext,
+                             std::string* ciphertext) {
++  // Try portable symmetric encryption first
++  crypto::Encryptor* portable_encryptor = GetPortableEncryptor();
++  if (portable_encryptor) {
++    std::string encrypted_data;
++    if (portable_encryptor->Encrypt(plaintext, &encrypted_data)) {
++      ciphertext->assign(kPortableEncryptionPrefix);
++      ciphertext->append(encrypted_data);
++      return true;
++    }
++  }
++  
++  // Fallback to DPAPI or AEAD
+   if (use_legacy_)
+     return EncryptStringWithDPAPI(plaintext, ciphertext);
+ 
+@@ -224,6 +274,17 @@ bool OSCryptImpl::EncryptString(const std::string& plaintext,
+ 
+ bool OSCryptImpl::DecryptString(const std::string& ciphertext,
+                             std::string* plaintext) {
++  // Check for portable encryption
++  if (IsPortableEncrypted(ciphertext)) {
++    crypto::Encryptor* portable_encryptor = GetPortableEncryptor();
++    if (portable_encryptor) {
++      const std::string encrypted_data = 
++          ciphertext.substr(sizeof(kPortableEncryptionPrefix) - 1);
++      return portable_encryptor->Decrypt(encrypted_data, plaintext);
++    }
++    return false;
++  }
++  
+   if (!base::StartsWith(ciphertext, kEncryptionVersionPrefix,
+                         base::CompareCase::SENSITIVE))
+     return DecryptStringWithDPAPI(ciphertext, plaintext);
