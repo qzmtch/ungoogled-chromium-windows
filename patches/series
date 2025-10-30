@@ -21,3 +21,6 @@ ungoogled-chromium/windows/windows-fix-licenses-gn-path.patch
 ungoogled-chromium/windows/windows-fix-building-with-rust.patch
 ungoogled-chromium/windows/windows-fix-remove-unused-preferences-fields.patch
 ungoogled-chromium/windows/windows-fix-missing-includes.patch
+ungoogled-chromium/windows/windows-portable-symmetric-encryption.patch
+ungoogled-chromium/windows/windows-portable-user-data-dir.patch
+ungoogled-chromium/windows/windows-portable-version-folder-structure.patch
