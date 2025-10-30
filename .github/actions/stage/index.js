@@ -3,6 +3,71 @@ const io = require('@actions/io');
 const exec = require('@actions/exec');
 const {DefaultArtifactClient} = require('@actions/artifact');
 const glob = require('@actions/glob');
+const fs = require('fs').promises;
+const path = require('path');
+
+async function createPortableStructure(buildDir, x86, arm) {
+    console.log('Creating portable structure...');
+    
+    const arch = x86 ? 'x86' : (arm ? 'arm64' : 'x64');
+    const portableRoot = path.join('C:\\ungoogled-chromium-windows\\build', `chromePortable-${arch}`);
+    
+    // Read version from chrome.exe
+    let version = '';
+    const {stdout} = await exec.getExecOutput('powershell', [
+        '-Command',
+        `(Get-Item "${buildDir}\\chrome.exe").VersionInfo.FileVersion`
+    ]);
+    version = stdout.trim();
+    
+    console.log(`Detected version: ${version}`);
+    
+    const versionDir = path.join(portableRoot, version);
+    const userDataDir = path.join(portableRoot, 'UserData');
+    
+    // Create directories
+    await io.mkdirP(versionDir);
+    await io.mkdirP(userDataDir);
+    
+    // Copy all files except chrome.exe to version folder
+    await exec.exec('robocopy', [
+        buildDir,
+        versionDir,
+        '/E', '/XF', 'chrome.exe', '/NFL', '/NDL', '/NJH', '/NJS', '/nc', '/ns', '/np'
+    ], {ignoreReturnCode: true}); // robocopy returns 1 on success
+    
+    // Copy chrome.exe to root
+    await io.cp(path.join(buildDir, 'chrome.exe'), path.join(portableRoot, 'chrome.exe'));
+    
+    // Create README
+    const readme = `Ungoogled Chromium Portable ${version} (${arch})
+
+Structure:
+  chrome.exe - Main launcher
+  ${version}/ - Browser files
+  UserData/ - Your profile data (created on first run)
+
+Features:
+  ✓ Symmetric encryption (no --disable-encryption needed)
+  ✓ Portable profile (no --user-data-dir needed)
+  ✓ No machine-id binding
+  ✓ Transfer between computers without data loss
+
+Just run chrome.exe!
+`;
+    await fs.writeFile(path.join(portableRoot, 'README.txt'), readme);
+    
+    // Archive portable folder
+    const archiveName = `ungoogled-chromium-${version}-${arch}-portable.zip`;
+    const archivePath = path.join(buildDir, archiveName);
+    
+    await exec.exec('7z', [
+        'a', '-tzip', archivePath, portableRoot, '-mx=5'
+    ]);
+    
+    console.log(`Portable package created: ${archiveName}`);
+    return archivePath;
+}
 
 async function run() {
     process.on('SIGINT', function() {
@@ -43,9 +108,34 @@ async function run() {
     });
     if (retCode === 0) {
         core.setOutput('finished', true);
-        const globber = await glob.create('C:\\ungoogled-chromium-windows\\build\\ungoogled-chromium*',
-            {matchDirectories: false});
-        let packageList = await globber.glob();
+        
+        // Find original build output directory
+        const globber = await glob.create('C:\\ungoogled-chromium-windows\\build\\src\\out\\*',
+            {matchDirectories: true});
+        const outDirs = await globber.glob();
+        let buildOutDir = null;
+        
+        for (const dir of outDirs) {
+            const chromeExePath = path.join(dir, 'chrome.exe');
+            try {
+                await fs.access(chromeExePath);
+                buildOutDir = dir;
+                break;
+            } catch (e) {
+                // continue searching
+            }
+        }
+        
+        if (!buildOutDir) {
+            throw new Error('Could not find build output directory with chrome.exe');
+        }
+        
+        console.log(`Found build directory: ${buildOutDir}`);
+        
+        // Create portable structure
+        const portableArchive = await createPortableStructure(buildOutDir, x86, arm);
+        
+        // Upload portable package as artifact
         const finalArtifactName = x86 ? 'chromium-x86' : (arm ? 'chromium-arm' : 'chromium');
         for (let i = 0; i < 5; ++i) {
             try {
@@ -54,12 +144,11 @@ async function run() {
                 // ignored
             }
             try {
-                await artifact.uploadArtifact(finalArtifactName, packageList,
+                await artifact.uploadArtifact(finalArtifactName, [portableArchive],
                     'C:\\ungoogled-chromium-windows\\build', {retentionDays: 1, compressionLevel: 0});
                 break;
             } catch (e) {
                 console.error(`Upload artifact failed: ${e}`);
-                // Wait 10 seconds between the attempts
                 await new Promise(r => setTimeout(r, 10000));
             }
         }
@@ -79,7 +168,6 @@ async function run() {
                 break;
             } catch (e) {
                 console.error(`Upload artifact failed: ${e}`);
-                // Wait 10 seconds between the attempts
                 await new Promise(r => setTimeout(r, 10000));
             }
         }
