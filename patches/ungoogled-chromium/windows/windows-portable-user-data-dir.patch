@@ -1,0 +1,45 @@
+--- a/chrome/common/chrome_paths_win.cc
++++ b/chrome/common/chrome_paths_win.cc
+@@ -11,6 +11,7 @@
+ 
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
++#include "base/command_line.h"
+ #include "base/path_service.h"
+ #include "base/win/scoped_co_mem.h"
+ #include "chrome/common/chrome_constants.h"
+@@ -38,6 +39,33 @@ bool GetUserDirectory(int csidl_folder, base::FilePath* result) {
+ }  // namespace
+ 
+ bool GetDefaultUserDataDirectory(base::FilePath* result) {
++  // Portable mode: check for UserData folder next to executable
++  base::FilePath exe_dir;
++  if (base::PathService::Get(base::DIR_EXE, &exe_dir)) {
++    // First, check if we're in a version subdirectory
++    // Structure: chromePortable/5.1.1130.129/chrome.dll
++    // We need to go up to chromePortable/UserData
++    base::FilePath current_dir = exe_dir;
++    base::FilePath parent_dir = current_dir.DirName();
++    
++    // Check parent/UserData (for version folder structure)
++    base::FilePath portable_data = parent_dir.Append(L"UserData");
++    
++    // Also check current_dir/UserData (for flat structure)
++    base::FilePath portable_data_local = current_dir.Append(L"UserData");
++    
++    // Use portable mode if either location makes sense
++    // We don't create the folder here, just set the path
++    // Chrome will create it on first run
++    if (!parent_dir.empty() && parent_dir != current_dir) {
++      *result = portable_data;
++      return true;
++    } else if (!current_dir.empty()) {
++      *result = portable_data_local;
++      return true;
++    }
++  }
++  
++  // Standard installation: use local app data
+   if (!base::PathService::Get(base::DIR_LOCAL_APP_DATA, result))
+     return false;
+   *result = result->Append(install_static::GetChromeInstallSubDirectory());
