@@ -1,0 +1,76 @@
+--- a/chrome/app/chrome_exe_main_win.cc
++++ b/chrome/app/chrome_exe_main_win.cc
+@@ -11,6 +11,7 @@
+ #include <stddef.h>
+ 
+ #include <algorithm>
++#include <filesystem>
+ #include <array>
+ #include <string>
+ #include <vector>
+@@ -67,13 +68,57 @@ namespace {
+ // to an arbitrary directory to child processes (e.g., the crashpad handler
+ // process) created before MainDllLoader changes the current working directory
+ // to the browser's version directory.
++//
++// Modified to support portable version folder structure:
++// chromePortable/
++//   chrome.exe
++//   5.1.1130.129/
++//     chrome.dll
++//     ...
++//   UserData/
+ void SetCwdForBrowserProcess() {
+   if (!::IsBrowserProcess())
+     return;
+ 
+   std::array<wchar_t, MAX_PATH + 1> buffer;
+   buffer[0] = L'\0';
+   DWORD length = ::GetModuleFileName(nullptr, &buffer[0], buffer.size());
+   if (!length || length >= buffer.size())
+     return;
+ 
+-  base::SetCurrentDirectory(
+-      base::FilePath(base::FilePath::StringViewType(&buffer[0], length))
+-          .DirName());
++  base::FilePath exe_path(base::FilePath::StringViewType(&buffer[0], length));
++  base::FilePath exe_dir = exe_path.DirName();
++  
++  // Check if chrome.dll exists in current directory
++  base::FilePath chrome_dll = exe_dir.Append(L"chrome.dll");
++  
++  if (!base::PathExists(chrome_dll)) {
++    // chrome.dll not found in exe directory
++    // Look for version subdirectories
++    std::error_code ec;
++    for (const auto& entry : std::filesystem::directory_iterator(
++             exe_dir.value(), ec)) {
++      if (!entry.is_directory(ec))
++        continue;
++      
++      base::FilePath version_dir(entry.path().wstring());
++      base::FilePath version_chrome_dll = version_dir.Append(L"chrome.dll");
++      
++      if (base::PathExists(version_chrome_dll)) {
++        // Found chrome.dll in version subdirectory
++        // Set working directory to version directory
++        base::SetCurrentDirectory(version_dir);
++        
++        // Also update PATH to include the version directory
++        // so DLLs can be found
++        std::array<wchar_t, 32768> path_buffer;
++        DWORD path_len = ::GetEnvironmentVariableW(L"PATH", path_buffer.data(), 
++                                                    path_buffer.size());
++        if (path_len > 0 && path_len < path_buffer.size()) {
++          std::wstring new_path = version_dir.value() + L";" + 
++                                  std::wstring(path_buffer.data(), path_len);
++          ::SetEnvironmentVariableW(L"PATH", new_path.c_str());
++        }
++        return;
++      }
++    }
++  }
++  
++  // Standard case: chrome.dll is in the same directory as chrome.exe
++  base::SetCurrentDirectory(exe_dir);
+ }
