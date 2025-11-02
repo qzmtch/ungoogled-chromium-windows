@@ -6,131 +6,6 @@ const glob = require('@actions/glob');
 const fs = require('fs').promises;
 const path = require('path');
 
-async function createPortableStructure(buildDir, x86, arm) {
-    console.log('Creating portable structure...');
-    
-    const arch = x86 ? 'x86' : (arm ? 'arm64' : 'x64');
-    const portableRoot = path.join(buildDir, `chromePortable-${arch}`);
-    
-    // Read version from version.dll or chrome.exe
-    let version = '';
-    try {
-        const {stdout} = await exec.getExecOutput('powershell', [
-            '-Command',
-            `(Get-Item "${buildDir}\\chrome.exe").VersionInfo.FileVersion`
-        ]);
-        version = stdout.trim();
-    } catch (e) {
-        console.error('Failed to get version:', e);
-        version = 'unknown';
-    }
-    
-    console.log(`Detected version: ${version}`);
-    
-    const versionDir = path.join(portableRoot, version);
-    const userDataDir = path.join(portableRoot, 'UserData');
-    
-    // Create directories
-    await io.mkdirP(versionDir);
-    await io.mkdirP(userDataDir);
-    
-    // Get list of files in build directory
-    const files = await fs.readdir(buildDir);
-    
-    // Copy files
-    for (const file of files) {
-        const srcPath = path.join(buildDir, file);
-        const stat = await fs.stat(srcPath);
-        
-        if (file === 'chrome.exe') {
-            // Copy chrome.exe to root
-            await io.cp(srcPath, path.join(portableRoot, 'chrome.exe'));
-        } else if (file.startsWith('chromePortable-')) {
-            // Skip our own portable folders
-            continue;
-        } else {
-            // Copy everything else to version folder
-            const destPath = path.join(versionDir, file);
-            if (stat.isDirectory()) {
-                await io.cp(srcPath, destPath, {recursive: true});
-            } else {
-                await io.cp(srcPath, destPath);
-            }
-        }
-    }
-    
-    // Create README
-    const readme = `Ungoogled Chromium Portable ${version} (${arch})
-
-=======================================================
-PORTABLE VERSION - NO INSTALLATION REQUIRED
-=======================================================
-
-STRUCTURE:
-----------
-chromePortable-${arch}/
-  ├── chrome.exe          ← Run this file
-  ├── ${version}/         ← Browser binaries
-  │   ├── chrome.dll
-  │   ├── Locales/
-  │   ├── *.pak
-  │   └── ...
-  └── UserData/           ← Your profile (created on first run)
-      ├── Default/
-      └── ...
-
-FEATURES:
----------
-✅ Fully Portable       - Copy folder anywhere
-✅ Symmetric Encryption - Cookies/passwords work on any PC
-✅ Auto User Data Path  - No --user-data-dir needed  
-✅ No Machine Binding   - No --disable-machine-id needed
-✅ No DPAPI Dependency  - Transfer between Windows PCs freely
-
-USAGE:
-------
-1. Extract this archive
-2. Run chrome.exe
-3. Your data is automatically saved to UserData folder
-4. To move to another PC: copy entire folder
-
-NOTES:
-------
-- First run creates UserData folder automatically
-- All your settings, extensions, cookies are in UserData
-- Safe to delete UserData folder to start fresh
-- Version ${version} files are in the ${version} subfolder
-
-For more info: https://github.com/ungoogled-software/ungoogled-chromium-windows
-`;
-    await fs.writeFile(path.join(portableRoot, 'README.txt'), readme);
-    
-    // Create .gitignore for UserData
-    const gitignore = `# Ignore user data
-UserData/*
-!UserData/.gitkeep
-`;
-    await fs.writeFile(path.join(portableRoot, '.gitignore'), gitignore);
-    
-    // Create .gitkeep in UserData
-    await fs.writeFile(path.join(userDataDir, '.gitkeep'), '');
-    
-    // Archive portable folder
-    const archiveName = `ungoogled-chromium-${version}-${arch}-portable.zip`;
-    const archivePath = path.join(buildDir, archiveName);
-    
-    console.log(`Creating archive: ${archiveName}`);
-    await exec.exec('7z', [
-        'a', '-tzip', archivePath, portableRoot, '-mx=5', '-mmt=on'
-    ]);
-    
-    // Clean up portable folder
-    await io.rmRF(portableRoot);
-    
-    console.log(`✓ Portable package created: ${archiveName}`);
-    return archivePath;
-}
-
 async function run() {
     process.on('SIGINT', function() {
     })
@@ -171,43 +46,35 @@ async function run() {
     if (retCode === 0) {
         core.setOutput('finished', true);
         
-        // Find build output directory
-        const possiblePaths = [
-            'C:\\ungoogled-chromium-windows\\build\\src\\out\\Default',
-            'C:\\ungoogled-chromium-windows\\build\\src\\out\\Release',
-        ];
+        // Find mini_installer.exe
+        const globber = await glob.create('C:\\ungoogled-chromium-windows\\build\\src\\out\\*\\mini_installer.exe');
+        const installers = await globber.glob();
         
-        let buildOutDir = null;
-        for (const testPath of possiblePaths) {
-            const chromeExe = path.join(testPath, 'chrome.exe');
-            try {
-                await fs.access(chromeExe);
-                buildOutDir = testPath;
-                console.log(`Found build directory: ${buildOutDir}`);
-                break;
-            } catch (e) {
-                // Try next path
-            }
+        if (installers.length === 0) {
+            throw new Error('mini_installer.exe not found');
         }
         
-        if (!buildOutDir) {
-            // Search for any out directory with chrome.exe
-            const globber = await glob.create('C:\\ungoogled-chromium-windows\\build\\src\\out\\*\\chrome.exe');
-            const files = await globber.glob();
-            if (files.length > 0) {
-                buildOutDir = path.dirname(files[0]);
-                console.log(`Found build directory via glob: ${buildOutDir}`);
-            }
-        }
+        const installerPath = installers[0];
+        console.log(`Found installer: ${installerPath}`);
         
-        if (!buildOutDir) {
-            throw new Error('Could not find build output directory with chrome.exe');
-        }
+        // Get version
+        const {stdout} = await exec.getExecOutput('powershell', [
+            '-Command',
+            `(Get-Item "${installerPath}").VersionInfo.FileVersion`
+        ]);
+        const version = stdout.trim();
+        console.log(`Version: ${version}`);
         
-        // Create portable structure
-        const portableArchive = await createPortableStructure(buildOutDir, x86, arm);
+        // Copy and rename installer
+        const arch = x86 ? 'x86' : (arm ? 'arm64' : 'x64');
+        const finalName = `ungoogled-chromium-${version}-${arch}-installer.exe`;
+        const buildDir = path.dirname(installerPath);
+        const finalPath = path.join(buildDir, finalName);
         
-        // Upload portable package
+        await io.cp(installerPath, finalPath);
+        console.log(`Created: ${finalName}`);
+        
+        // Upload installer
         const finalArtifactName = x86 ? 'chromium-x86' : (arm ? 'chromium-arm' : 'chromium');
         for (let i = 0; i < 5; ++i) {
             try {
@@ -216,8 +83,8 @@ async function run() {
                 // ignored
             }
             try {
-                await artifact.uploadArtifact(finalArtifactName, [portableArchive],
-                    path.dirname(portableArchive), {retentionDays: 1, compressionLevel: 0});
+                await artifact.uploadArtifact(finalArtifactName, [finalPath],
+                    buildDir, {retentionDays: 1, compressionLevel: 0});
                 console.log(`✓ Artifact uploaded: ${finalArtifactName}`);
                 break;
             } catch (e) {
