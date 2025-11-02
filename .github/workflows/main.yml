@@ -419,17 +419,11 @@ jobs:
         with:
           fail_on_unmatched_files: true
           files: |
-            ungoogled-chromium-*-installer.exe
+            ungoogled-chromium-*-portable.zip
           body: |
-            ## 🚀 Ungoogled Chromium for Windows
-            
-            ### 📦 Download
-            - **ungoogled-chromium-*-x64-installer.exe** - 64-bit installer (~150-200 MB)
+            ## 🚀 Ungoogled Chromium Portable for Windows
             
             ### ✨ Features
-            - ✅ **Symmetric Encryption** - Cookies & passwords work across PCs
-            - ✅ **Auto User Data** - Profile stored next to executable
-            - ✅ **No Machine Binding** - No --disable-machine-id needed
-            
-            ### 📖 Installation
-            Run the installer and follow the prompts.
+            - ✅ **Fully Portable** (~200-300 MB)
+            - ✅ **Symmetric Encryption**
+            - ✅ **Auto User Data**
