@@ -413,26 +413,23 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: chromium
+      
       - name: Publish release
         uses: softprops/action-gh-release@v1
         with:
           fail_on_unmatched_files: true
           files: |
-            ungoogled-chromium*portable.zip
+            ungoogled-chromium-*-installer.exe
           body: |
-            ## Ungoogled Chromium Portable for Windows
+            ## 🚀 Ungoogled Chromium for Windows
             
-            ### Features
-            ✅ **Fully Portable** - No installation required
-            ✅ **Symmetric Encryption** - Cookies/passwords work across computers
-            ✅ **Auto User Data** - Profile stored next to executable
-            ✅ **No Extra Flags** - Just run chrome.exe
+            ### 📦 Download
+            - **ungoogled-chromium-*-x64-installer.exe** - 64-bit installer (~150-200 MB)
             
-            ### Downloads
-            - **x64** - For modern Intel/AMD processors (64-bit)
+            ### ✨ Features
+            - ✅ **Symmetric Encryption** - Cookies & passwords work across PCs
+            - ✅ **Auto User Data** - Profile stored next to executable
+            - ✅ **No Machine Binding** - No --disable-machine-id needed
             
-            ### Usage
-            1. Extract archive
-            2. Run `chrome.exe`
-            3. Your data is stored in `UserData` folder
-            4. Copy entire folder to transfer to another PC
+            ### 📖 Installation
+            Run the installer and follow the prompts.
