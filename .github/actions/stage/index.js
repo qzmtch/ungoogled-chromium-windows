@@ -1,6 +1,9 @@
+'use strict';
+
 const core = require('@actions/core');
 const exec = require('@actions/exec');
 const { DefaultArtifactClient } = require('@actions/artifact');
+const glob = require('@actions/glob');
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -43,7 +46,7 @@ async function uploadWithRetry(artifact, name, files, rootDirectory, compression
       try {
         await artifact.deleteArtifact(name);
       } catch {
-        // It is normal for the artifact not to exist on the first attempt.
+        // The artifact normally does not exist on the first attempt.
       }
 
       await artifact.uploadArtifact(name, files, rootDirectory, {
@@ -61,6 +64,131 @@ async function uploadWithRetry(artifact, name, files, rootDirectory, compression
   throw new Error(`Could not upload artifact "${name}" after 5 attempts: ${lastError}`);
 }
 
+async function restoreIntermediateSource(artifact, artifactName) {
+  let info;
+  try {
+    info = await artifact.getArtifact(artifactName);
+  } catch (error) {
+    throw new Error(`Could not find intermediate artifact "${artifactName}": ${error.message || error}`);
+  }
+  if (!info || !info.artifact || !info.artifact.id) {
+    throw new Error(`Intermediate artifact "${artifactName}" was not found in this workflow run.`);
+  }
+
+  await fs.mkdir(BUILD, { recursive: true });
+  await fs.rm(DOWNLOADED_ARCHIVE, { force: true });
+  await artifact.downloadArtifact(info.artifact.id, { path: BUILD });
+
+  if (!(await exists(DOWNLOADED_ARCHIVE))) {
+    throw new Error(`Downloaded intermediate archive not found: ${DOWNLOADED_ARCHIVE}`);
+  }
+
+  // The archive contains relative entries such as src/BUILD.gn.
+  await exec.exec('7z', ['x', DOWNLOADED_ARCHIVE, `-o${BUILD}`, '-y'], { cwd: ROOT });
+  await fs.rm(DOWNLOADED_ARCHIVE, { force: true });
+
+  if (!(await exists(path.join(SRC, 'BUILD.gn')))) {
+    throw new Error(
+      `Restored source tree is missing ${path.join(SRC, 'BUILD.gn')}. ` +
+      'The intermediate archive must contain src/BUILD.gn at its root.'
+    );
+  }
+  console.log('Restored source tree successfully.');
+}
+
+async function createIntermediateArtifact(artifact, artifactName) {
+  // A nonzero build.py exit code is accepted only when the known CI timeout
+  // in build.py fired. Never archive the source tree after patch/download/GN errors.
+  const requiredAfterTimeout = [
+    path.join(SRC, 'BUILD.gn'),
+    path.join(SRC, 'out', 'Default', 'args.gn'),
+    path.join(SRC, 'out', 'Default', 'gn.exe'),
+    path.join(SRC, 'third_party', 'rust-toolchain', 'bin', 'bindgen.exe'),
+    path.join(SRC, 'third_party', 'ninja', 'ninja.exe'),
+  ];
+  const missing = [];
+  for (const filePath of requiredAfterTimeout) {
+    if (!(await exists(filePath))) missing.push(filePath);
+  }
+  if (missing.length) {
+    throw new Error(
+      'build.py did not complete the source preparation/build-tool setup. ' +
+      'Refusing to upload an incomplete intermediate artifact. Missing:\n' + missing.join('\n')
+    );
+  }
+
+  await fs.rm(STAGE_ARCHIVE, { force: true });
+  // Store relative paths so extracting into build recreates build/src.
+  await exec.exec('7z', ['a', '-tzip', STAGE_ARCHIVE, 'src', '-mx=3', '-mtc=on'], {
+    cwd: BUILD,
+  });
+
+  const archiveInfo = await fs.stat(STAGE_ARCHIVE);
+  if (!archiveInfo.size) {
+    throw new Error('The intermediate source archive is empty.');
+  }
+
+  await uploadWithRetry(artifact, artifactName, [STAGE_ARCHIVE], ROOT, 0);
+  core.setOutput('finished', 'false');
+}
+
+async function createPortableArtifact(artifact, finalArtifactName, arch) {
+  // build.py --ci runs package.py itself after the full compile succeeds.
+  const packagePattern = path.join(BUILD, `ungoogled-chromium_*_windows_${arch}.zip`);
+  const packageGlob = await glob.create(packagePattern, { matchDirectories: false });
+  const packageZips = await packageGlob.glob();
+
+  if (packageZips.length === 0) {
+    throw new Error(
+      `build.py returned success, but the browser package ZIP was not found: ${packagePattern}. ` +
+      'Refusing to publish the installer or an incomplete browser.'
+    );
+  }
+  if (packageZips.length > 1) {
+    throw new Error(`Expected one browser package ZIP, found ${packageZips.length}: ${packageZips.join(', ')}`);
+  }
+
+  await fs.rm(PORTABLE_DIR, { recursive: true, force: true });
+  await fs.mkdir(PORTABLE_DIR, { recursive: true });
+  await exec.exec('7z', ['x', packageZips[0], `-o${PORTABLE_DIR}`, '-y'], { cwd: BUILD });
+
+  const chromeExe = path.join(PORTABLE_DIR, 'chrome.exe');
+  if (!(await exists(chromeExe))) {
+    throw new Error(
+      `Browser ZIP extracted, but chrome.exe is missing from ${PORTABLE_DIR}. ` +
+      'Inspect package.py ZIP entries before publishing.'
+    );
+  }
+
+  // Chromium itself reads this marker to select UserData next to chrome.exe.
+  // No BAT launcher, extra DLL, or command-line switch is added here.
+  await fs.writeFile(path.join(PORTABLE_DIR, 'portable.flag'), '');
+
+  let hasChromeDll = await exists(path.join(PORTABLE_DIR, 'chrome.dll'));
+  if (!hasChromeDll) {
+    const entries = await fs.readdir(PORTABLE_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && await exists(path.join(PORTABLE_DIR, entry.name, 'chrome.dll'))) {
+        hasChromeDll = true;
+        break;
+      }
+    }
+  }
+  if (!hasChromeDll) {
+    throw new Error(`chrome.dll was not found next to chrome.exe or in an immediate subfolder of ${PORTABLE_DIR}.`);
+  }
+
+  const portableFiles = await collectFilesRecursively(PORTABLE_DIR);
+  if (!portableFiles.length) {
+    throw new Error(`Portable directory is empty: ${PORTABLE_DIR}`);
+  }
+
+  // Upload individual files with chromePortable/ as their preserved top-level path.
+  // The release job can then zip only the compiled browser, not build/src.
+  await uploadWithRetry(artifact, finalArtifactName, portableFiles, BUILD, 6);
+  core.setOutput('finished', 'true');
+}
+
 async function run() {
   const finished = core.getBooleanInput('finished', { required: true });
   const fromArtifact = core.getBooleanInput('from_artifact', { required: true });
@@ -75,36 +203,16 @@ async function run() {
     : (arm ? 'chromium-arm' : 'chromium');
   const arch = x86 ? 'x86' : (arm ? 'arm64' : 'x64');
 
-  console.log(`finished=${finished}, from_artifact=${fromArtifact}, arch=${arch}`);
+  console.log(`finished=${finished}, fromArtifact=${fromArtifact}, arch=${arch}`);
 
-  // If an earlier stage completed the build, preserve its output and stop here.
   if (finished) {
     core.setOutput('finished', 'true');
     return;
   }
 
   const artifact = new DefaultArtifactClient();
-
   if (fromArtifact) {
-    const info = await artifact.getArtifact(intermediateArtifactName);
-    await artifact.downloadArtifact(info.artifact.id, { path: BUILD });
-
-    if (!(await exists(DOWNLOADED_ARCHIVE))) {
-      throw new Error(`Downloaded intermediate archive not found: ${DOWNLOADED_ARCHIVE}`);
-    }
-
-    // The intermediate archive is created with entries relative to BUILD (src/...).
-    // Extracting to BUILD must recreate BUILD/src, not a nested repository path.
-    await exec.exec('7z', ['x', DOWNLOADED_ARCHIVE, `-o${BUILD}`, '-y'], { cwd: ROOT });
-    await fs.rm(DOWNLOADED_ARCHIVE, { force: true });
-
-    if (!(await exists(path.join(SRC, 'BUILD.gn')))) {
-      throw new Error(
-        `Restored source tree is missing ${path.join(SRC, 'BUILD.gn')}. ` +
-        'The intermediate ZIP must contain src/BUILD.gn at its root.'
-      );
-    }
-    console.log('Restored source tree successfully.');
+    await restoreIntermediateSource(artifact, intermediateArtifactName);
   }
 
   const args = ['build.py', '--ci'];
@@ -116,96 +224,39 @@ async function run() {
     ignoreReturnCode: true,
   });
 
+  // Only the explicit timeout marker emitted by build.py's 3.5-hour CI build
+  // timer is treated as a resumable stage. Patch errors (including malformed
+  // diff files), download errors and compiler errors must fail immediately.
+  let recentBuildOutput = '';
+  const rememberBuildOutput = (chunk) => {
+    recentBuildOutput = (recentBuildOutput + chunk.toString()).slice(-50000);
+  };
+
   const exitCode = await exec.exec('python', args, {
     cwd: ROOT,
     ignoreReturnCode: true,
+    listeners: {
+      stdout: rememberBuildOutput,
+      stderr: rememberBuildOutput,
+    },
   });
   console.log(`build.py exit code: ${exitCode}`);
 
   if (exitCode === 0) {
-    // package.py emits the actual unpacked-browser ZIP in BUILD.
-    const packagePattern = path.join(BUILD, `ungoogled-chromium_*_windows_${arch}.zip`);
-    const glob = require('@actions/glob');
-    const packageGlob = await glob.create(packagePattern, { matchDirectories: false });
-    const packageZips = await packageGlob.glob();
-    if (packageZips.length === 0) {
-      throw new Error(
-        `Build returned success, but package.py ZIP was not found: ${packagePattern}. ` +
-        'The workflow must publish the browser package, not mini_installer.exe.'
-      );
-    }
-    if (packageZips.length > 1) {
-      throw new Error(`Expected one browser package ZIP, found ${packageZips.length}: ${packageZips.join(', ')}`);
-    }
-
-    await fs.rm(PORTABLE_DIR, { recursive: true, force: true });
-    await fs.mkdir(PORTABLE_DIR, { recursive: true });
-    await exec.exec('7z', ['x', packageZips[0], `-o${PORTABLE_DIR}`, '-y'], { cwd: BUILD });
-
-    const chromeExe = path.join(PORTABLE_DIR, 'chrome.exe');
-    if (!(await exists(chromeExe))) {
-      throw new Error(
-        `The package ZIP was extracted, but chrome.exe is missing from ${PORTABLE_DIR}. ` +
-        'Inspect package.py ZIP entries before publishing.'
-      );
-    }
-
-    // The portable path is selected inside Chromium by checking this marker next to
-    // chrome.exe. No BAT launcher, extra DLL, working-directory assumption, or
-    // command-line switch is involved, so direct launches and browser restarts work.
-    await fs.writeFile(path.join(PORTABLE_DIR, 'portable.flag'), '');
-
-    // Support both a flat package and the version-subdirectory layout used by some
-    // Chromium Windows distributions (chrome.exe at root, chrome.dll one level down).
-    let hasChromeDll = await exists(path.join(PORTABLE_DIR, 'chrome.dll'));
-    if (!hasChromeDll) {
-      const entries = await fs.readdir(PORTABLE_DIR, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && await exists(path.join(PORTABLE_DIR, entry.name, 'chrome.dll'))) {
-          hasChromeDll = true;
-          break;
-        }
-      }
-    }
-    if (!hasChromeDll) {
-      throw new Error(
-        `chrome.dll was not found next to chrome.exe or in an immediate version subfolder of ${PORTABLE_DIR}.`
-      );
-    }
-
-    const portableFiles = await collectFilesRecursively(PORTABLE_DIR);
-    if (portableFiles.length === 0) {
-      throw new Error(`Portable directory is empty: ${PORTABLE_DIR}`);
-    }
-
-    // Keep chromePortable/ as the top-level directory when the Actions artifact is extracted.
-    // A release job can then create the downloadable chromePortable.zip from that folder.
-    await uploadWithRetry(artifact, finalArtifactName, portableFiles, BUILD, 6);
-    core.setOutput('finished', 'true');
+    await createPortableArtifact(artifact, finalArtifactName, arch);
     return;
   }
 
-  // The CI build deliberately stops after its time budget; save src for the next stage.
-  if (!(await exists(path.join(SRC, 'BUILD.gn')))) {
+  const expectedCiTimeout = /Sending keyboard interrupt/i.test(recentBuildOutput);
+  if (!expectedCiTimeout) {
     throw new Error(
-      `build.py returned ${exitCode}, but ${path.join(SRC, 'BUILD.gn')} is missing. ` +
-      'This looks like a source preparation/patch error rather than a resumable compile stage.'
+      `build.py failed with exit code ${exitCode}. This was not the expected CI time-limit stop; ` +
+      'no intermediate artifact will be created. See the build.py error above.'
     );
   }
 
-  await fs.rm(STAGE_ARCHIVE, { force: true });
-  // Use relative entries (src/...) so the next runner can extract into BUILD correctly.
-  await exec.exec('7z', ['a', '-tzip', STAGE_ARCHIVE, 'src', '-mx=3', '-mtc=on'], {
-    cwd: BUILD,
-  });
-
-  const archiveInfo = await fs.stat(STAGE_ARCHIVE);
-  if (archiveInfo.size === 0) {
-    throw new Error('The intermediate source archive is empty.');
-  }
-
-  await uploadWithRetry(artifact, intermediateArtifactName, [STAGE_ARCHIVE], ROOT, 0);
-  core.setOutput('finished', 'false');
+  console.log('Detected build.py CI time-limit stop; validating build state before saving intermediate source.');
+  await createIntermediateArtifact(artifact, intermediateArtifactName);
 }
 
 run().catch((error) => {
