@@ -402,34 +402,46 @@ jobs:
         with:
           finished: ${{ join(needs.*.outputs.finished) }}
           from_artifact: true
+      - name: Require completed build
+        if: ${{ steps.stage.outputs.finished != 'true' }}
+        shell: pwsh
+        run: throw "Build did not produce the portable package after the final stage."
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
 
   publish-release:
     needs: [build-16]
+    if: ${{ startsWith(github.ref, 'refs/tags/') && needs.build-16.outputs.finished == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download x64 package
         uses: actions/download-artifact@v4
         with:
           name: chromium
-      
+          path: release-staging
+
+      - name: Create portable ZIP
+        run: |
+          test -f release-staging/chromePortable/chrome.exe
+          test -f release-staging/chromePortable/portable.flag
+          cd release-staging
+          zip -qr ../chromePortable.zip chromePortable
+
       - name: Publish release
         uses: softprops/action-gh-release@v1
         with:
           fail_on_unmatched_files: true
           files: |
-            ungoogled-chromium-*-installer.exe
+            chromePortable.zip
           body: |
             ## 🚀 Ungoogled Chromium for Windows
-            
+
             ### 📦 Download
-            - **ungoogled-chromium-*-x64-installer.exe** - 64-bit installer (~150-200 MB)
-            
+            - **chromePortable.zip** - portable browser in the `chromePortable` folder
+
             ### ✨ Features
-            - ✅ **Symmetric Encryption** - Cookies & passwords work across PCs
-            - ✅ **Auto User Data** - Profile stored next to executable
-            - ✅ **No Machine Binding** - No --disable-machine-id needed
-            
+            - ✅ Portable profile in `chromePortable/UserData`
+            - ✅ `Launch.bat` starts the browser without encryption-disabling command-line switches
+
             ### 📖 Installation
-            Run the installer and follow the prompts.
+            Extract `chromePortable.zip` and run `Launch.bat`.
