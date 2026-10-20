@@ -150,13 +150,28 @@ async function run() {
       );
     }
 
-    // Marker consumed by the portable-profile patch; no browser command-line switch is used.
+    // The portable path is selected inside Chromium by checking this marker next to
+    // chrome.exe. No BAT launcher, extra DLL, working-directory assumption, or
+    // command-line switch is involved, so direct launches and browser restarts work.
     await fs.writeFile(path.join(PORTABLE_DIR, 'portable.flag'), '');
-    await fs.writeFile(
-      path.join(PORTABLE_DIR, 'Launch.bat'),
-      '@echo off\r\ncd /d "%~dp0"\r\nstart "" "%~dp0chrome.exe"\r\n',
-      'ascii'
-    );
+
+    // Support both a flat package and the version-subdirectory layout used by some
+    // Chromium Windows distributions (chrome.exe at root, chrome.dll one level down).
+    let hasChromeDll = await exists(path.join(PORTABLE_DIR, 'chrome.dll'));
+    if (!hasChromeDll) {
+      const entries = await fs.readdir(PORTABLE_DIR, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && await exists(path.join(PORTABLE_DIR, entry.name, 'chrome.dll'))) {
+          hasChromeDll = true;
+          break;
+        }
+      }
+    }
+    if (!hasChromeDll) {
+      throw new Error(
+        `chrome.dll was not found next to chrome.exe or in an immediate version subfolder of ${PORTABLE_DIR}.`
+      );
+    }
 
     const portableFiles = await collectFilesRecursively(PORTABLE_DIR);
     if (portableFiles.length === 0) {
