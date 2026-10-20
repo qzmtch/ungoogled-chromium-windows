@@ -421,27 +421,56 @@ jobs:
           path: release-staging
 
       - name: Create portable ZIP
+        id: package
+        shell: bash
         run: |
+          set -euo pipefail
           test -f release-staging/chromePortable/chrome.exe
           test -f release-staging/chromePortable/portable.flag
           cd release-staging
-          zip -qr ../chromePortable.zip chromePortable
+          # Package only the compiled browser folder, never the multi-gigabyte build/src tree.
+          zip -qr -9 ../chromePortable.zip chromePortable
+          cd ..
+
+          size=$(stat -c '%s' chromePortable.zip)
+          echo "chromePortable.zip size: ${size} bytes"
+          if [ "$size" -lt 2147483648 ]; then
+            {
+              echo 'release_files<<RELEASE_FILES_EOF'
+              echo 'chromePortable.zip'
+              echo 'RELEASE_FILES_EOF'
+            } >> "$GITHUB_OUTPUT"
+          else
+            # GitHub Releases rejects a single asset >= 2 GiB. Split only when needed;
+            # each volume stays below the per-file limit.
+            split -b 1900M -d -a 2 chromePortable.zip chromePortable.zip.part-
+            {
+              echo 'release_files<<RELEASE_FILES_EOF'
+              printf '%s\n' chromePortable.zip.part-*
+              echo 'RELEASE_FILES_EOF'
+            } >> "$GITHUB_OUTPUT"
+            rm chromePortable.zip
+          fi
 
       - name: Publish release
         uses: softprops/action-gh-release@v1
         with:
           fail_on_unmatched_files: true
-          files: |
-            chromePortable.zip
+          files: ${{ steps.package.outputs.release_files }}
           body: |
             ## 🚀 Ungoogled Chromium for Windows
 
             ### 📦 Download
-            - **chromePortable.zip** - portable browser in the `chromePortable` folder
+            Normally download `chromePortable.zip`, extract it, and run `chrome.exe` directly.
+            If the archive is split, download every `chromePortable.zip.part-XX` file and join
+            them in numeric order before extracting.
 
             ### ✨ Features
-            - ✅ Portable profile in `chromePortable/UserData`
-            - ✅ `Launch.bat` starts the browser without encryption-disabling command-line switches
+            - Portable profile stored in `chromePortable/UserData`
+            - Works when launched directly, through file associations, and after Chromium restarts
+            - No launcher BAT and no external `version.dll`
+            - No command-line switches that disable encryption
 
-            ### 📖 Installation
-            Extract `chromePortable.zip` and run `Launch.bat`.
+            If the archive exceeds GitHub's 2 GiB per-file limit, it is published as numbered
+            `chromePortable.zip.part-XX` files. Download all parts into one directory and
+            concatenate them in numeric order to reconstruct `chromePortable.zip` before extracting.
