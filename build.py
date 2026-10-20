@@ -306,7 +306,7 @@ def main():
                                    'chromedriver', 'mini_installer', timeout=3.5*60*60)
         # package
         os.chdir(_ROOT_DIR)
-        subprocess.run([sys.executable, 'package.py'])
+        subprocess.run([sys.executable, 'package.py'], check=True)
     else:
         _run_build_process('third_party\\ninja\\ninja.exe', '-C', 'out\\Default', 'chrome',
                            'chromedriver', 'mini_installer')
