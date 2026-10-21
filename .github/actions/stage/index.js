@@ -118,16 +118,47 @@ async function createIntermediateArtifact(artifact, artifactName) {
   }
 
   await fs.rm(STAGE_ARCHIVE, { force: true });
-  // Store relative paths so extracting into build recreates build/src.
-  await exec.exec('7z', ['a', '-tzip', STAGE_ARCHIVE, 'src', '-mx=3', '-mtc=on'], {
-    cwd: BUILD,
-  });
 
-  const archiveInfo = await fs.stat(STAGE_ARCHIVE);
-  if (!archiveInfo.size) {
-    throw new Error('The intermediate source archive is empty.');
+  // Store relative paths so extracting into build recreates build/src.
+  // 7-Zip may return code 1 for missing/broken non-Windows source paths while
+  // still producing a usable ZIP. Accept only code 0 or 1, and test the ZIP
+  // before uploading it. Fatal 7-Zip errors and a failed integrity test stop the stage.
+  const archiveExitCode = await exec.exec(
+    '7z',
+    ['a', '-tzip', STAGE_ARCHIVE, 'src', '-mx=3', '-mtc=on'],
+    {
+      cwd: BUILD,
+      ignoreReturnCode: true,
+    }
+  );
+
+  if (archiveExitCode !== 0 && archiveExitCode !== 1) {
+    throw new Error(`7-Zip failed to create the intermediate archive (exit code ${archiveExitCode}).`);
   }
 
+  const archiveInfo = await fs.stat(STAGE_ARCHIVE).catch(() => null);
+  if (!archiveInfo || !archiveInfo.size) {
+    throw new Error('The intermediate source archive is missing or empty.');
+  }
+
+  if (archiveExitCode === 1) {
+    core.warning(
+      '7-Zip returned warning code 1 while creating the intermediate ZIP. ' +
+      'Testing the archive before upload; review the missing-path warnings above.'
+    );
+  }
+
+  const testExitCode = await exec.exec('7z', ['t', STAGE_ARCHIVE], {
+    cwd: BUILD,
+    ignoreReturnCode: true,
+  });
+  if (testExitCode !== 0) {
+    throw new Error(
+      `The intermediate source ZIP failed 7-Zip integrity testing (exit code ${testExitCode}); it will not be uploaded.`
+    );
+  }
+
+  console.log(`Intermediate ZIP passed integrity test (${archiveInfo.size} bytes).`);
   await uploadWithRetry(artifact, artifactName, [STAGE_ARCHIVE], ROOT, 0);
   core.setOutput('finished', 'false');
 }
