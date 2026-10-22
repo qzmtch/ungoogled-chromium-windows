@@ -211,10 +211,12 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
   const chromeExe = path.join(PORTABLE_DIR, 'chrome.exe');
   if (!(await exists(chromeExe))) {
     const topLevelEntries = await fs.readdir(PORTABLE_DIR).catch(() => []);
+    const expectedWrapperExists = await exists(chromeExeInPackageRoot);
     throw new Error(
-      `Browser ZIP was extracted, but chrome.exe was not found at ${chromeExe}. ` +
-      `Expected either a flat archive or ${chromeExeInPackageRoot}. ` +
-      `Current top-level entries: ${topLevelEntries.join(', ') || '(empty)'}`
+      `[PORTABLE-LAYOUT-FIX-v2] Browser package extracted, but chrome.exe is still missing. ` +
+      `Expected root: ${chromeExe}; expected wrapper path: ${chromeExeInPackageRoot}; ` +
+      `wrapper chrome.exe exists: ${expectedWrapperExists}; ` +
+      `top-level entries: ${topLevelEntries.join(', ') || '(empty)'}`
     );
   }
 
@@ -248,6 +250,7 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
 }
 
 async function run() {
+  console.log('[PORTABLE-LAYOUT-FIX-v2] Updated .github/actions/stage/index.js loaded.');
   const finished = core.getBooleanInput('finished', { required: true });
   const fromArtifact = core.getBooleanInput('from_artifact', { required: true });
   const x86 = core.getBooleanInput('x86', { required: false });
