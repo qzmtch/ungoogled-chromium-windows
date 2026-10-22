@@ -183,11 +183,38 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
   await fs.mkdir(PORTABLE_DIR, { recursive: true });
   await exec.exec('7z', ['x', packageZips[0], `-o${PORTABLE_DIR}`, '-y'], { cwd: BUILD });
 
+  // package.py uses filescfg.create_archive(), which intentionally puts all
+  // files under a top-level directory named after the ZIP (output_path.stem).
+  // Flatten that one wrapper directory so chrome.exe and portable.flag end up
+  // directly in chromePortable, as expected by the release artifact.
+  const packageRootName = path.basename(packageZips[0], path.extname(packageZips[0]));
+  const extractedPackageRoot = path.join(PORTABLE_DIR, packageRootName);
+  const chromeExeInPackageRoot = path.join(extractedPackageRoot, 'chrome.exe');
+  const chromeExeAtRoot = path.join(PORTABLE_DIR, 'chrome.exe');
+
+  if (!(await exists(chromeExeAtRoot)) && await exists(chromeExeInPackageRoot)) {
+    console.log(`Flattening package archive root: ${extractedPackageRoot}`);
+    const rootEntries = await fs.readdir(extractedPackageRoot);
+    for (const entryName of rootEntries) {
+      const sourcePath = path.join(extractedPackageRoot, entryName);
+      const destinationPath = path.join(PORTABLE_DIR, entryName);
+      if (await exists(destinationPath)) {
+        throw new Error(
+          `Cannot flatten browser package: destination already exists: ${destinationPath}`
+        );
+      }
+      await fs.rename(sourcePath, destinationPath);
+    }
+    await fs.rm(extractedPackageRoot, { recursive: true, force: true });
+  }
+
   const chromeExe = path.join(PORTABLE_DIR, 'chrome.exe');
   if (!(await exists(chromeExe))) {
+    const topLevelEntries = await fs.readdir(PORTABLE_DIR).catch(() => []);
     throw new Error(
-      `Browser ZIP extracted, but chrome.exe is missing from ${PORTABLE_DIR}. ` +
-      'Inspect package.py ZIP entries before publishing.'
+      `Browser ZIP was extracted, but chrome.exe was not found at ${chromeExe}. ` +
+      `Expected either a flat archive or ${chromeExeInPackageRoot}. ` +
+      `Current top-level entries: ${topLevelEntries.join(', ') || '(empty)'}`
     );
   }
 
