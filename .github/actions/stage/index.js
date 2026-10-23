@@ -97,9 +97,9 @@ async function restoreIntermediateSource(artifact, artifactName) {
 }
 
 async function createIntermediateArtifact(artifact, artifactName) {
-  // A nonzero build.py exit code is accepted only when the known CI timeout
-  // in build.py fired. Never archive the source tree after patch/download/GN errors.
-  const requiredAfterTimeout = [
+  // Save a resumable checkpoint after the CI time limit or a Ninja subcommand
+  // failure. Earlier preparation failures are filtered in run() before we get here.
+  const requiredForResume = [
     path.join(SRC, 'BUILD.gn'),
     path.join(SRC, 'out', 'Default', 'args.gn'),
     path.join(SRC, 'out', 'Default', 'gn.exe'),
@@ -107,7 +107,7 @@ async function createIntermediateArtifact(artifact, artifactName) {
     path.join(SRC, 'third_party', 'ninja', 'ninja.exe'),
   ];
   const missing = [];
-  for (const filePath of requiredAfterTimeout) {
+  for (const filePath of requiredForResume) {
     if (!(await exists(filePath))) missing.push(filePath);
   }
   if (missing.length) {
@@ -183,10 +183,9 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
   await fs.mkdir(PORTABLE_DIR, { recursive: true });
   await exec.exec('7z', ['x', packageZips[0], `-o${PORTABLE_DIR}`, '-y'], { cwd: BUILD });
 
-  // package.py uses filescfg.create_archive(), which intentionally puts all
-  // files under a top-level directory named after the ZIP (output_path.stem).
-  // Flatten that one wrapper directory so chrome.exe and portable.flag end up
-  // directly in chromePortable, as expected by the release artifact.
+  // package.py's create_archive() stores the payload under a wrapper folder
+  // named after the ZIP. Flatten that wrapper so chrome.exe and portable.flag
+  // live directly under chromePortable/.
   const packageRootName = path.basename(packageZips[0], path.extname(packageZips[0]));
   const extractedPackageRoot = path.join(PORTABLE_DIR, packageRootName);
   const chromeExeInPackageRoot = path.join(extractedPackageRoot, 'chrome.exe');
@@ -210,13 +209,9 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
 
   const chromeExe = path.join(PORTABLE_DIR, 'chrome.exe');
   if (!(await exists(chromeExe))) {
-    const topLevelEntries = await fs.readdir(PORTABLE_DIR).catch(() => []);
-    const expectedWrapperExists = await exists(chromeExeInPackageRoot);
     throw new Error(
-      `[PORTABLE-LAYOUT-FIX-v2] Browser package extracted, but chrome.exe is still missing. ` +
-      `Expected root: ${chromeExe}; expected wrapper path: ${chromeExeInPackageRoot}; ` +
-      `wrapper chrome.exe exists: ${expectedWrapperExists}; ` +
-      `top-level entries: ${topLevelEntries.join(', ') || '(empty)'}`
+      `Browser ZIP extracted, but chrome.exe is missing from ${PORTABLE_DIR}. ` +
+      'Inspect package.py ZIP entries before publishing.'
     );
   }
 
@@ -251,6 +246,7 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
 
 async function run() {
   console.log('[PORTABLE-LAYOUT-FIX-v2] Updated .github/actions/stage/index.js loaded.');
+  console.log('[RESUMABLE-NINJA-CHECKPOINT-v1] Ninja failure recovery handler loaded.');
   const finished = core.getBooleanInput('finished', { required: true });
   const fromArtifact = core.getBooleanInput('from_artifact', { required: true });
   const x86 = core.getBooleanInput('x86', { required: false });
@@ -285,9 +281,10 @@ async function run() {
     ignoreReturnCode: true,
   });
 
-  // Only the explicit timeout marker emitted by build.py's 3.5-hour CI build
-  // timer is treated as a resumable stage. Patch errors (including malformed
-  // diff files), download errors and compiler errors must fail immediately.
+  // Capture the end of build.py output so we can distinguish a normal CI
+  // timeout or a Ninja subcommand failure from earlier setup/patch/GN failures.
+  // Ninja failures are checkpointed and retried by the next stage: this preserves
+  // hours of completed work and allows a transient failed action to run again.
   let recentBuildOutput = '';
   const rememberBuildOutput = (chunk) => {
     recentBuildOutput = (recentBuildOutput + chunk.toString()).slice(-50000);
@@ -309,14 +306,27 @@ async function run() {
   }
 
   const expectedCiTimeout = /Sending keyboard interrupt/i.test(recentBuildOutput);
-  if (!expectedCiTimeout) {
+  const ninjaSubcommandFailure =
+    /ninja:\s*build stopped:\s*subcommand failed/i.test(recentBuildOutput) &&
+    /RuntimeError:\s*Build failed!/i.test(recentBuildOutput);
+
+  if (!expectedCiTimeout && !ninjaSubcommandFailure) {
     throw new Error(
-      `build.py failed with exit code ${exitCode}. This was not the expected CI time-limit stop; ` +
-      'no intermediate artifact will be created. See the build.py error above.'
+      `build.py failed with exit code ${exitCode}. The log does not identify this as ` +
+      'a resumable Ninja failure or the expected CI time-limit stop; no intermediate ' +
+      'artifact will be created. See the build.py error above.'
     );
   }
 
-  console.log('Detected build.py CI time-limit stop; validating build state before saving intermediate source.');
+  if (ninjaSubcommandFailure) {
+    core.warning(
+      'Ninja reported a failed build subcommand. Saving the current source/build state ' +
+      'so the next stage can retry the incremental build.'
+    );
+    console.log('[RESUMABLE-NINJA-CHECKPOINT-v1] Saving checkpoint after Ninja subcommand failure.');
+  } else {
+    console.log('Detected build.py CI time-limit stop; validating build state before saving intermediate source.');
+  }
   await createIntermediateArtifact(artifact, intermediateArtifactName);
 }
 
