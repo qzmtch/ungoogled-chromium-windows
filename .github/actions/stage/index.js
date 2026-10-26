@@ -247,7 +247,9 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
 async function run() {
   console.log('[PORTABLE-LAYOUT-FIX-v2] Updated .github/actions/stage/index.js loaded.');
   console.log('[RESUMABLE-NINJA-CHECKPOINT-v1] Ninja failure recovery handler loaded.');
-  const finished = core.getBooleanInput('finished', { required: true });
+  console.log('[STAGE-INPUT-FIX-v1] Missing finished input safely defaults to false.');
+  const finishedInput = core.getInput('finished').trim();
+  const finished = finishedInput === '' ? false : core.getBooleanInput('finished');
   const fromArtifact = core.getBooleanInput('from_artifact', { required: true });
   const x86 = core.getBooleanInput('x86', { required: false });
   const arm = core.getBooleanInput('arm', { required: false });
