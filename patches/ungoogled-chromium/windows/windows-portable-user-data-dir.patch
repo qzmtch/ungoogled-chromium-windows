@@ -1,68 +1,30 @@
 --- a/chrome/install_static/user_data_dir.cc
 +++ b/chrome/install_static/user_data_dir.cc
-@@ -8,7 +8,8 @@
- #include <assert.h>
- #include <stdlib.h>
- 
- #include <optional>
-+#include <vector>
- #include "chrome/chrome_elf/nt_registry/nt_registry.h"
- #include "chrome/install_static/install_details.h"
- #include "chrome/install_static/install_util.h"
-@@ -73,24 +74,33 @@
+@@ -73,2 +73,21 @@
  bool GetDefaultUserDataDirectory(const InstallConstants& mode,
                                   std::wstring* result) {
--  // This environment variable should be set on Windows Vista and later
--  // (https://msdn.microsoft.com/library/windows/desktop/dd378457.aspx).
--  std::wstring user_data_dir = GetEnvironmentString(L"LOCALAPPDATA");
--  if (user_data_dir.empty()) {
--    // LOCALAPPDATA was not set; fallback to the temporary files path.
--    DWORD size = ::GetTempPath(0, nullptr);
--    if (!size)
--      return false;
--    user_data_dir.resize(size + 1);
--    size = ::GetTempPath(size + 1, &user_data_dir[0]);
--    if (!size || size >= user_data_dir.size())
--      return false;
--    user_data_dir.resize(size);
--  }
--  result->swap(user_data_dir);
--  if ((*result)[result->length() - 1] != L'\\')
--    result->push_back(L'\\');
--  AppendChromeInstallSubDirectory(mode, true /* include_suffix */, result);
--  result->push_back(L'\\');
--  result->append(L"User Data");
-+  // This build is distributed as a portable package. Use a UserData folder
-+  // next to chrome.exe for every process unless --user-data-dir was supplied.
-+  // GetUserDataDirectoryImpl() applies the command-line override before it
-+  // calls this default-path function.
-+  (void)mode;
-+  std::vector<wchar_t> executable_path(MAX_PATH);
-+  DWORD length = ::GetModuleFileNameW(
-+      nullptr, executable_path.data(),
-+      static_cast<DWORD>(executable_path.size()));
-+  while (static_cast<size_t>(length) == executable_path.size()) {
-+    if (executable_path.size() >= 32768)
-+      return false;
-+    executable_path.resize(executable_path.size() < 16384
-+                               ? executable_path.size() * 2
-+                               : 32768);
-+    length = ::GetModuleFileNameW(
-+        nullptr, executable_path.data(),
-+        static_cast<DWORD>(executable_path.size()));
-+  }
-+  if (!length)
++  // Portable build: use UserData beside chrome.exe by default.
++  // An explicit --user-data-dir is processed by GetUserDataDirectoryImpl()
++  // before this fallback is reached, so the command-line override is kept.
++  // Use the executable path, not the current working directory: Chrome changes
++  // its working directory while loading chrome.dll from the version folder.
++  constexpr DWORD kExecutablePathBufferSize = 32768;
++  wchar_t executable_path[kExecutablePathBufferSize];
++  const DWORD length = ::GetModuleFileNameW(
++      nullptr, executable_path, kExecutablePathBufferSize);
++  if (!length || length >= kExecutablePathBufferSize)
 +    return false;
 +
-+  std::wstring user_data_dir(executable_path.data(), length);
++  std::wstring user_data_dir(executable_path, length);
 +  const size_t separator = user_data_dir.find_last_of(L"\\/");
 +  if (separator == std::wstring::npos)
 +    return false;
++
 +  user_data_dir.resize(separator);
 +  user_data_dir.append(L"\\UserData");
 +  result->swap(user_data_dir);
-   return true;
- }
++  return true;
++
 --- a/chrome/common/chrome_paths_win.cc
 +++ b/chrome/common/chrome_paths_win.cc
 @@ -38,7 +38,6 @@
