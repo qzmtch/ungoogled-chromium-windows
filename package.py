@@ -89,8 +89,11 @@ def _create_portable_archive(file_paths, build_outputs, output_path, timestamp=N
         raise FileNotFoundError(
             'chrome.exe was not included by chrome/tools/build/win/FILES.cfg')
 
-    archive_root = Path('chromePortable')
-    version_root = archive_root / get_chromium_version()
+    # The ZIP is extracted directly into build/chromePortable by
+    # .github/actions/stage/index.js. Therefore archive paths must be relative
+    # to the chromePortable directory itself; do NOT add a chromePortable/
+    # prefix inside the archive.
+    version_root = Path(get_chromium_version())
     fixed_datetime = _archive_datetime(timestamp)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,7 +101,7 @@ def _create_portable_archive(file_paths, build_outputs, output_path, timestamp=N
                          compresslevel=9, allowZip64=True) as archive:
         # Explicit directory entries make the intended structure visible when
         # opening the ZIP, even before the browser has been run once.
-        for directory in (archive_root, version_root, archive_root / 'UserData'):
+        for directory in (version_root, Path('UserData')):
             directory_name = directory.as_posix().rstrip('/') + '/'
             if fixed_datetime is None:
                 archive.writestr(directory_name, b'')
@@ -114,7 +117,7 @@ def _create_portable_archive(file_paths, build_outputs, output_path, timestamp=N
                 raise FileNotFoundError(f'Packaging input does not exist: {source}')
 
             if relative_path == chrome_exe:
-                archive_path = archive_root / chrome_exe
+                archive_path = chrome_exe
             else:
                 archive_path = version_root / relative_path
 
