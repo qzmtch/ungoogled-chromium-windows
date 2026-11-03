@@ -1,0 +1,156 @@
+--- a/components/os_crypt/sync/os_crypt_win.cc
++++ b/components/os_crypt/sync/os_crypt_win.cc
+@@ -47,2 +47,10 @@
+ // Key prefix for a key encrypted with DPAPI.
+ constexpr char kDPAPIKeyPrefix[] = "DPAPI";
++// Key prefix for a key encrypted with the build portable wrapping key.
++constexpr char kPortableKeyPrefix[] = "PORTABLE";
++constexpr char kPortableKeyAad[] = "ungoogled-chromium-portable-oscrypt-key-v1";
++constexpr unsigned char kPortableOsCryptWrappingKey[] = {
++    PORTABLE_OSCRYPT_KEY_PLACEHOLDER
++};
++static_assert(sizeof(kPortableOsCryptWrappingKey) == kKeyLength,
++              "Portable OSCrypt wrapping key must be 256 bits.");
+@@ -109,12 +109,57 @@
+-// Takes `key` and encrypts it with DPAPI, then stores it in the `local_state`.
+-// Returns true if the key was successfully encrypted and stored.
++// Wraps the profile's random AES key with the build-specific portable key.
++// The random nonce and GCM authentication tag are stored with the ciphertext.
++bool EncryptStringWithPortableKey(const std::string& plaintext,
++                                  std::string* ciphertext) {
++  const std::string wrapping_key(
++      reinterpret_cast<const char*>(
++          kPortableOsCryptWrappingKey),
++      sizeof(kPortableOsCryptWrappingKey));
++
++  crypto::Aead aead(crypto::Aead::AES_256_GCM);
++  aead.Init(&wrapping_key);
++
++  std::string nonce;
++  crypto::RandBytes(base::WriteInto(&nonce, kNonceLength + 1), kNonceLength);
++
++  std::string encrypted_data;
++  if (!aead.Seal(plaintext, nonce, kPortableKeyAad, &encrypted_data))
++    return false;
++
++  ciphertext->assign(kPortableKeyPrefix);
++  ciphertext->append(nonce);
++  ciphertext->append(encrypted_data);
++  return true;
++}
++
++bool DecryptStringWithPortableKey(const std::string& ciphertext,
++                                  std::string* plaintext) {
++  constexpr size_t kAeadTagLength = 128 / 8;
++  constexpr size_t kPrefixLength = sizeof(kPortableKeyPrefix) - 1;
++  if (ciphertext.size() < kPrefixLength + kNonceLength + kAeadTagLength)
++    return false;
++
++  const std::string wrapping_key(
++      reinterpret_cast<const char*>(
++          kPortableOsCryptWrappingKey),
++      sizeof(kPortableOsCryptWrappingKey));
++
++  crypto::Aead aead(crypto::Aead::AES_256_GCM);
++  aead.Init(&wrapping_key);
++
++  const std::string nonce = ciphertext.substr(kPrefixLength, kNonceLength);
++  const std::string encrypted_data =
++      ciphertext.substr(kPrefixLength + kNonceLength);
++  return aead.Open(encrypted_data, nonce, kPortableKeyAad, plaintext);
++}
++
++// Stores the profile key in Local State using the portable wrapping key.
++// The profile key itself remains random and is still used by Chromium's
++// standard AES-256-GCM v10 encryption for passwords, cookies, and other data.
+ bool EncryptAndStoreKey(const std::string& key, PrefService* local_state) {
+   std::string encrypted_key;
+-  if (!EncryptStringWithDPAPI(key, &encrypted_key)) {
++  if (!EncryptStringWithPortableKey(key, &encrypted_key)) {
+     return false;
+   }
+ 
+-  // Add header indicating this key is encrypted with DPAPI.
+-  encrypted_key.insert(0, kDPAPIKeyPrefix);
+   std::string base64_key;
+   base::Base64Encode(encrypted_key, &base64_key);
+@@ -252,9 +252,10 @@
+       return false;
+     case OSCrypt::kDecryptionFailed:
+-      break;
++      // Never replace an existing key that could not be decrypted. Doing so
++      // would make previously stored passwords and cookies inaccessible.
++      return false;
+   }
+ 
+-  // If there is no key in the local state, or if DPAPI decryption fails,
+-  // generate a new key.
++  // If there is no key in the local state, generate a new key.
+   std::string key;
+   crypto::RandBytes(base::WriteInto(&key, kKeyLength + 1), kKeyLength);
+@@ -265,5 +266,4 @@
+   }
+ 
+-  // This new key is already encrypted with audit flag enabled.
+   local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
+ 
+@@ -281,6 +281,25 @@
+   std::string encrypted_key_with_header;
+ 
+-  base::Base64Decode(base64_encrypted_key, &encrypted_key_with_header);
++  if (!base::Base64Decode(base64_encrypted_key, &encrypted_key_with_header))
++    return OSCrypt::kInvalidKeyFormat;
+ 
++  std::string key;
++
++  // Portable Local State: open the wrapped profile key with this build's
++  // stable key. This format is valid across computers and browser updates
++  // as long as the GitHub Actions secret remains unchanged.
++  if (base::StartsWith(encrypted_key_with_header, kPortableKeyPrefix,
++                       base::CompareCase::SENSITIVE)) {
++    if (!DecryptStringWithPortableKey(encrypted_key_with_header, &key))
++      return OSCrypt::kDecryptionFailed;
++    if (key.size() != kKeyLength)
++      return OSCrypt::kInvalidKeyFormat;
++
++    encryption_key_.assign(key);
++    return OSCrypt::kSuccess;
++  }
++
++  // Legacy Local State: decrypt the old DPAPI-protected profile key on the
++  // original Windows account, then immediately migrate it to portable form.
+   if (!base::StartsWith(encrypted_key_with_header, kDPAPIKeyPrefix,
+                         base::CompareCase::SENSITIVE)) {
+@@ -291,5 +310,4 @@
+   const std::string encrypted_key =
+       encrypted_key_with_header.substr(sizeof(kDPAPIKeyPrefix) - 1);
+-  std::string key;
+   // This DPAPI decryption can fail if the user's password has been reset
+   // by an Administrator.
+@@ -300,16 +318,16 @@
+   }
+ 
+-  if (!local_state->GetBoolean(kOsCryptAuditEnabledPrefName)) {
+-    // In theory, EncryptAndStoreKey could fail if DPAPI fails to encrypt, but
+-    // DPAPI decrypted the old data fine. In this case it's better to leave the
+-    // previously encrypted key, since the code has been able to decrypt it.
+-    // Trying over and over makes no sense so the code explicitly does not
+-    // attempt again, and audit will simply not be enabled in this case.
+-    std::ignore = EncryptAndStoreKey(key, local_state);
++  if (key.size() != kKeyLength)
++    return OSCrypt::kInvalidKeyFormat;
+ 
+-    // Indicate that an attempt has been made to turn audit flag on, so retry is
+-    // not attempted.
+-    local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
++  // Migrate regardless of os_crypt.audit_enabled. That flag describes the
++  // old DPAPI audit attempt and must not suppress portable-key migration.
++  if (!EncryptAndStoreKey(key, local_state)) {
++    LOG(ERROR) << "Failed to migrate the OSCrypt profile key to portable "
++                  "form.";
++    return OSCrypt::kDecryptionFailed;
+   }
++
++  local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
+   encryption_key_.assign(key);
+   return OSCrypt::kSuccess;
