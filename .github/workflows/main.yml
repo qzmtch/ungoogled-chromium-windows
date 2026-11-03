@@ -18,6 +18,12 @@ jobs:
           python-version: '3.12'
       - name: Init
         run: Copy-Item -Path . -Destination "C:\ungoogled-chromium-windows" -Recurse
+      - name: Prepare portable OSCrypt key
+        shell: pwsh
+        working-directory: C:\ungoogled-chromium-windows
+        env:
+          PORTABLE_OSCRYPT_KEY: ${{ secrets.PORTABLE_OSCRYPT_KEY }}
+        run: python generate_portable_oscrypt_key_patch.py
       - name: Setup Stage
         run: npm install
         working-directory: ./.github/actions/stage
@@ -408,7 +414,6 @@ jobs:
         run: throw "Build did not produce the portable package after the final stage."
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
-
   publish-release:
     needs: [build-16]
     if: ${{ startsWith(github.ref, 'refs/tags/') && needs.build-16.outputs.finished == 'true' }}
