@@ -26,8 +26,8 @@
 +  crypto::Aead aead(crypto::Aead::AES_256_GCM);
 +  aead.Init(&wrapping_key);
 +
-+  std::string nonce;
-+  crypto::RandBytes(base::WriteInto(&nonce, kNonceLength + 1), kNonceLength);
++  std::string nonce(kNonceLength, '\0');
++  crypto::RandBytes(base::as_writable_byte_span(nonce));
 +
 +  std::string encrypted_data;
 +  if (!aead.Seal(plaintext, nonce, kPortableKeyAad, &encrypted_data))
@@ -86,21 +86,21 @@
 -  // If there is no key in the local state, or if DPAPI decryption fails,
 -  // generate a new key.
 +  // If there is no key in the local state, generate a new key.
-   std::string key;
-   crypto::RandBytes(base::WriteInto(&key, kKeyLength + 1), kKeyLength);
+   std::string key(kKeyLength, '\0');
+   crypto::RandBytes(base::as_writable_byte_span(key));
 @@ -265,5 +266,4 @@
    }
  
 -  // This new key is already encrypted with audit flag enabled.
    local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
  
-@@ -281,6 +281,25 @@
+@@ -281,5 +281,25 @@
    std::string encrypted_key_with_header;
  
 -  base::Base64Decode(base64_encrypted_key, &encrypted_key_with_header);
 +  if (!base::Base64Decode(base64_encrypted_key, &encrypted_key_with_header))
 +    return OSCrypt::kInvalidKeyFormat;
- 
++
 +  std::string key;
 +
 +  // Portable Local State: open the wrapped profile key with this build's
@@ -154,3 +154,10 @@
 +  local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
    encryption_key_.assign(key);
    return OSCrypt::kSuccess;
+--- a/chrome/browser/chrome_browser_main_win.cc
++++ b/chrome/browser/chrome_browser_main_win.cc
+@@ -525,3 +525,3 @@
+   // Initialize the OSCrypt.
+   bool os_crypt_init = OSCrypt::Init(local_state);
+-  DCHECK(os_crypt_init);
++  CHECK(os_crypt_init) << "Failed to initialize portable OSCrypt.";
