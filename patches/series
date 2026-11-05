@@ -2,6 +2,7 @@ ungoogled-chromium/windows/windows-disable-reorder-fix-linking.patch
 ungoogled-chromium/windows/windows-disable-win-build-output.patch
 ungoogled-chromium/windows/windows-disable-rcpy.patch
 ungoogled-chromium/windows/windows-fix-building-gn.patch
+ungoogled-chromium/windows/windows-portable-oscrypt-encryption.patch
 ungoogled-chromium/windows/windows-disable-encryption.patch
 ungoogled-chromium/windows/windows-disable-machine-id.patch
 ungoogled-chromium/windows/windows-compile-mini-installer.patch
@@ -22,4 +23,3 @@ ungoogled-chromium/windows/windows-fix-building-with-rust.patch
 ungoogled-chromium/windows/windows-fix-remove-unused-preferences-fields.patch
 ungoogled-chromium/windows/windows-fix-missing-includes.patch
 ungoogled-chromium/windows/windows-portable-user-data-dir.patch
-ungoogled-chromium/windows/windows-portable-oscrypt-encryption.patch
