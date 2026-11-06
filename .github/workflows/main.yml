@@ -1,5 +1,5 @@
 name: CI
-on:  
+on:
   workflow_dispatch:
   push:
     tags:
@@ -18,12 +18,12 @@ jobs:
           python-version: '3.12'
       - name: Init
         run: Copy-Item -Path . -Destination "C:\ungoogled-chromium-windows" -Recurse
-      - name: Prepare portable OSCrypt key
+      - name: Install portable OSCrypt post-patch hook
         shell: pwsh
         working-directory: C:\ungoogled-chromium-windows
         env:
           PORTABLE_OSCRYPT_KEY: ${{ secrets.PORTABLE_OSCRYPT_KEY }}
-        run: python generate_portable_oscrypt_key_patch.py
+        run: python prepare_portable_oscrypt_build_hook.py
       - name: Setup Stage
         run: npm install
         working-directory: ./.github/actions/stage
@@ -33,6 +33,8 @@ jobs:
         with:
           finished: false
           from_artifact: false
+        env:
+          PORTABLE_OSCRYPT_KEY: ${{ secrets.PORTABLE_OSCRYPT_KEY }}
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
   build-2:
@@ -424,7 +426,6 @@ jobs:
         with:
           name: chromium
           path: release-staging
-
       - name: Create portable ZIP
         id: package
         shell: bash
@@ -436,7 +437,6 @@ jobs:
           # Package only the compiled browser folder, never the multi-gigabyte build/src tree.
           zip -qr -9 ../chromePortable.zip chromePortable
           cd ..
-
           size=$(stat -c '%s' chromePortable.zip)
           echo "chromePortable.zip size: ${size} bytes"
           if [ "$size" -lt 2147483648 ]; then
@@ -456,7 +456,6 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             rm chromePortable.zip
           fi
-
       - name: Publish release
         uses: softprops/action-gh-release@v1
         with:
@@ -464,18 +463,15 @@ jobs:
           files: ${{ steps.package.outputs.release_files }}
           body: |
             ## 🚀 Ungoogled Chromium for Windows
-
             ### 📦 Download
             Normally download `chromePortable.zip`, extract it, and run `chrome.exe` directly.
             If the archive is split, download every `chromePortable.zip.part-XX` file and join
             them in numeric order before extracting.
-
             ### ✨ Features
             - Portable profile stored in `chromePortable/UserData`
             - Works when launched directly, through file associations, and after Chromium restarts
             - No launcher BAT and no external `version.dll`
             - No command-line switches that disable encryption
-
             If the archive exceeds GitHub's 2 GiB per-file limit, it is published as numbered
             `chromePortable.zip.part-XX` files. Download all parts into one directory and
             concatenate them in numeric order to reconstruct `chromePortable.zip` before extracting.
