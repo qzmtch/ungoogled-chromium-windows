@@ -1,6 +1,6 @@
 --- a/components/os_crypt/sync/os_crypt_win.cc
 +++ b/components/os_crypt/sync/os_crypt_win.cc
-@@ -47,2 +47,10 @@
+@@ -45,6 +45,14 @@
  // Key prefix for a key encrypted with DPAPI.
  constexpr char kDPAPIKeyPrefix[] = "DPAPI";
 +// Key prefix for a key encrypted with the build portable wrapping key.
@@ -11,7 +11,15 @@
 +};
 +static_assert(sizeof(kPortableOsCryptWrappingKey) == kKeyLength,
 +              "Portable OSCrypt wrapping key must be 256 bits.");
-@@ -109,12 +109,57 @@
+ 
+ bool EncryptStringWithDPAPI(const std::string& plaintext,
+                             std::string* ciphertext) {
+   DATA_BLOB input;
+@@ -103,19 +111,64 @@
+   plaintext->assign(reinterpret_cast<char*>(output.pbData), output.cbData);
+   LocalFree(output.pbData);
+   return true;
+ }
 -// Takes `key` and encrypts it with DPAPI, then stores it in the `local_state`.
 -// Returns true if the key was successfully encrypted and stored.
 +// Wraps the profile's random AES key with the build-specific portable key.
@@ -74,7 +82,10 @@
 -  encrypted_key.insert(0, kDPAPIKeyPrefix);
    std::string base64_key;
    base::Base64Encode(encrypted_key, &base64_key);
-@@ -252,9 +252,10 @@
+   local_state->SetString(kOsCryptEncryptedKeyPrefName, base64_key);
+   return true;
+ }
+@@ -240,9 +293,10 @@
        return false;
      case OSCrypt::kDecryptionFailed:
 -      break;
@@ -88,13 +99,13 @@
 +  // If there is no key in the local state, generate a new key.
    std::string key(kKeyLength, '\0');
    crypto::RandBytes(base::as_writable_byte_span(key));
-@@ -265,5 +266,4 @@
+@@ -251,5 +305,4 @@
    }
  
 -  // This new key is already encrypted with audit flag enabled.
    local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
  
-@@ -281,33 +281,49 @@
+@@ -265,33 +318,49 @@
    const std::string base64_encrypted_key =
        local_state->GetString(kOsCryptEncryptedKeyPrefName);
    std::string encrypted_key_with_header;
@@ -161,7 +172,7 @@
  }
 --- a/components/os_crypt/async/browser/dpapi_key_provider.cc
 +++ b/components/os_crypt/async/browser/dpapi_key_provider.cc
-@@ -19,6 +19,7 @@
+@@ -18,6 +18,7 @@
  #include "base/notreached.h"
  #include "base/types/expected.h"
  #include "base/win/scoped_localalloc.h"
@@ -169,7 +180,7 @@
  #include "components/os_crypt/async/common/algorithm.mojom.h"
  #include "components/prefs/pref_service.h"
  
-@@ -36,6 +37,45 @@
+@@ -35,6 +36,45 @@
  // Key prefix for a key encrypted with DPAPI. This must match kDPAPIKeyPrefix in
  // os_crypt_win.cc to ensure the same key can be decrypted successfully.
  constexpr uint8_t kDPAPIKeyPrefix[] = {'D', 'P', 'A', 'P', 'I'};
@@ -215,7 +226,7 @@
  
  std::optional<std::vector<uint8_t>> DecryptKeyWithDPAPI(
      base::span<const uint8_t> ciphertext) {
-@@ -80,19 +120,34 @@
+@@ -76,19 +116,34 @@
      return base::unexpected(KeyStatus::kKeyDecodeFailure);
    }
  
@@ -275,8 +286,13 @@
      libs = [ "crypt32.lib" ]
 --- a/chrome/browser/chrome_browser_main_win.cc
 +++ b/chrome/browser/chrome_browser_main_win.cc
-@@ -525,3 +525,3 @@
+@@ -526,8 +526,8 @@
    // Initialize the OSCrypt.
    bool os_crypt_init = OSCrypt::Init(local_state);
 -  DCHECK(os_crypt_init);
 +  CHECK(os_crypt_init) << "Failed to initialize portable OSCrypt.";
+ 
+   base::SetExtraNoExecuteAllowedPath(chrome::DIR_USER_DATA);
+   ChromeBrowserMainParts::PreCreateMainMessageLoop();
+   if (!is_integration_test()) {
+     // Make sure that we know how to handle exceptions from the message loop.
