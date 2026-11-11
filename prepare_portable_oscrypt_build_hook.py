@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Install the portable OSCrypt and tracked-preference post-patch steps."""
-
+"""Install the existing portable OSCrypt/device-ID steps plus optional UI step."""
 from __future__ import annotations
 
 import os
@@ -10,10 +9,10 @@ from pathlib import Path
 
 HOOK_MARKER = "# PORTABLE_OSCRYPT_POST_PATCH_HOOK"
 SUBSTITUTE_MARKER = "        # Substitute domains\n"
-
 HOOK_BLOCK = '''        # PORTABLE_OSCRYPT_POST_PATCH_HOOK
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_oscrypt.py'), str(source_tree)], check=True)
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_device_id.py'), str(source_tree)], check=True)
+        subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_ui_features.py'), str(source_tree)], check=True)
 '''
 
 
@@ -30,8 +29,11 @@ def main() -> int:
         validate_secret()
         root = Path(__file__).resolve().parent
         build_py = root / "build.py"
-        required = [root / "apply_portable_oscrypt.py", root / "apply_portable_device_id.py"]
-
+        required = [
+            root / "apply_portable_oscrypt.py",
+            root / "apply_portable_device_id.py",
+            root / "apply_portable_ui_features.py",
+        ]
         for path in required:
             if not path.is_file():
                 raise RuntimeError(f"Required post-processor is missing: {path.name}")
@@ -40,16 +42,21 @@ def main() -> int:
 
         source = build_py.read_text(encoding="utf-8")
         if HOOK_MARKER in source:
-            # Replace the previous one-step hook (if present) with the current
-            # two-step hook. This also keeps repeated execution idempotent.
             start = source.index(HOOK_MARKER)
             line_start = source.rfind("\n", 0, start) + 1
             next_marker = source.find(SUBSTITUTE_MARKER, start)
             if next_marker < 0:
-                raise RuntimeError("Existing portable post-patch hook has no following Substitute domains marker.")
+                raise RuntimeError(
+                    "Existing portable post-patch hook has no following Substitute domains marker."
+                )
+            # Replace only the previous portable hook block. The OSCrypt and
+            # device-ID processors remain in the same order and are not edited.
             source = source[:line_start] + HOOK_BLOCK + source[next_marker:]
             build_py.write_text(source, encoding="utf-8", newline="\n")
-            print("Updated portable OSCrypt + device-ID post-patch hook in the build working copy.")
+            print(
+                "Updated post-patch hook: OSCrypt, device-ID compatibility, "
+                "then compact UI/tab-discard changes."
+            )
             return 0
 
         if source.count(SUBSTITUTE_MARKER) != 1:
@@ -57,10 +64,12 @@ def main() -> int:
                 "Could not find exactly one build.py marker '        # Substitute domains'. "
                 "The build.py layout may have changed."
             )
-
         source = source.replace(SUBSTITUTE_MARKER, HOOK_BLOCK + SUBSTITUTE_MARKER, 1)
         build_py.write_text(source, encoding="utf-8", newline="\n")
-        print("Installed portable OSCrypt + device-ID post-patch hook in the build working copy.")
+        print(
+            "Installed post-patch hook: OSCrypt, device-ID compatibility, "
+            "then compact UI/tab-discard changes."
+        )
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
