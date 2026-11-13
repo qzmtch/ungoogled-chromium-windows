@@ -208,7 +208,8 @@ def apply_tab_discard(root: Path) -> None:
           break;
         }
         const int replacement_index = context_index > 0 ? context_index - 1 : 1;
-        ActivateTabAt(replacement_index, /*user_gesture=*/false);
+        ActivateTabAt(replacement_index, TabStripUserGestureDetails(
+            TabStripUserGestureDetails::GestureType::kNone));
       }
 
       if (content::WebContents* contents = GetWebContentsAt(context_index)) {
@@ -233,7 +234,8 @@ def apply_tab_discard(root: Path) -> None:
       // Keep the right-clicked tab as the selected tab. Every other tab is
       // therefore in the background before the discard requests are issued.
       if (active_index() != context_index) {
-        ActivateTabAt(context_index, /*user_gesture=*/false);
+        ActivateTabAt(context_index, TabStripUserGestureDetails(
+            TabStripUserGestureDetails::GestureType::kNone));
       }
 
       // Iterate by index; discarding does not remove tabs from the strip.
@@ -264,6 +266,27 @@ def apply_tab_discard(root: Path) -> None:
             source, execute_anchor, execute_cases,
             f"{rel_cc}: context-menu execution switch",
         )
+
+    # Chromium 141 changed ActivateTabAt's second parameter from bool to
+    # TabStripUserGestureDetails. Convert the two synthetic non-user activations
+    # both on a clean tree and on a tree where an older version of this
+    # post-processor already inserted its marked command block.
+    gesture_replacements = {
+        "ActivateTabAt(replacement_index, /*user_gesture=*/false);":
+            "ActivateTabAt(replacement_index, TabStripUserGestureDetails(\n"
+            "            TabStripUserGestureDetails::GestureType::kNone));",
+        "ActivateTabAt(context_index, /*user_gesture=*/false);":
+            "ActivateTabAt(context_index, TabStripUserGestureDetails(\n"
+            "            TabStripUserGestureDetails::GestureType::kNone));",
+    }
+    for old_call, new_call in gesture_replacements.items():
+        if old_call in source:
+            if source.count(old_call) != 1:
+                raise RuntimeError(
+                    f"{rel_cc}: expected one outdated activation call {old_call!r}, "
+                    f"found {source.count(old_call)}"
+                )
+            source = source.replace(old_call, new_call, 1)
 
     write_if_changed(path_cc, path_cc.read_text(encoding="utf-8"), source)
 
