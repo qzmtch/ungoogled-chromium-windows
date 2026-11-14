@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Apply compact menu metrics and clicked-tab discard commands to Chromium 141."""
+"""Apply portable UI refinements to Chromium 141 source."""
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -33,22 +34,34 @@ def replace_once_or_present(text: str, old: str, new: str, label: str) -> str:
 def apply_menu_density(root: Path) -> None:
     rel = "ui/views/controls/menu/menu_config.cc"
     path, source = read_text(root, rel)
-    if "// PORTABLE_UI_MENU_DENSITY" in source:
-        return
-    old = """  item_vertical_margin = 6;
+    if "// PORTABLE_UI_MENU_DENSITY" not in source:
+        old = """  item_vertical_margin = 6;
   item_horizontal_border_padding = 12;
   arrow_size = 16;
   separator_height = 17;
   separator_spacing_height = 4;
 """
-    new = """  // PORTABLE_UI_MENU_DENSITY: compact menus without shrinking their fonts.
+        new = """  // PORTABLE_UI_MENU_DENSITY: compact menus without shrinking their fonts.
   item_vertical_margin = 3;
-  item_horizontal_border_padding = 12;
+  item_horizontal_border_padding = 0;
   arrow_size = 16;
   separator_height = 13;
   separator_spacing_height = 2;
 """
-    source = replace_once_or_present(source, old, new, rel)
+        source = replace_once_or_present(source, old, new, rel)
+    else:
+        # Earlier UI builds already had the marker but retained a 12px side gutter.
+        source, count = re.subn(
+            r"(?m)^(\s*item_horizontal_border_padding\s*=\s*)12(;)",
+            r"\g<1>0\2",
+            source,
+        )
+        if count > 1:
+            raise RuntimeError(f"{rel}: found multiple horizontal border padding settings")
+        if count == 0 and not re.search(
+            r"(?m)^\s*item_horizontal_border_padding\s*=\s*0;", source
+        ):
+            raise RuntimeError(f"{rel}: could not verify horizontal border padding setting")
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
 
@@ -94,9 +107,7 @@ def apply_app_menu_density(root: Path) -> None:
 
 
 def apply_tab_discard(root: Path) -> None:
-    # Add two independent context-menu commands. Both are always present on the
-    # tab that was right-clicked; neither command follows the active tab or the
-    # multi-selection. The clicked index is the sole target/reference.
+    # Both commands are always tied to the tab whose context menu was opened.
     rel_h = "chrome/browser/ui/tabs/tab_strip_model.h"
     path_h, header = read_text(root, rel_h)
     legacy_markers = (
@@ -122,87 +133,83 @@ def apply_tab_discard(root: Path) -> None:
 
     rel_cc = "chrome/browser/ui/tabs/tab_strip_model.cc"
     path_cc, source = read_text(root, rel_cc)
-    needed_includes = [
-        '#include "chrome/browser/performance_manager/public/user_tuning/user_tuning_utils.h"',
-        '#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"',
-        '#include "components/performance_manager/public/performance_manager.h"',
-    ]
-    if "// PORTABLE_UI_TAB_DISCARD_INCLUDES" not in source:
-        include_anchor = '#include "chrome/browser/lifetime/browser_shutdown.h"\n'
-        include_block = (
-            include_anchor
-            + "// PORTABLE_UI_TAB_DISCARD_INCLUDES\n"
-            + "\n".join(needed_includes)
-            + "\n"
-        )
+    lifecycle_include = (
+        '#include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"'
+    )
+    if lifecycle_include not in source:
+        anchor = '#include "chrome/browser/lifetime/browser_shutdown.h"\n'
         source = replace_once_or_present(
-            source, include_anchor, include_block,
-            f"{rel_cc}: performance-manager includes",
+            source, anchor, anchor + lifecycle_include + "\n",
+            f"{rel_cc}: TabLifecycleUnitExternal include",
         )
-    else:
-        for include in needed_includes:
-            if include not in source:
-                raise RuntimeError(f"{rel_cc}: discard include marker exists but {include} is missing")
+    lifecycle_state_include = (
+        '#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"'
+    )
+    if lifecycle_state_include not in source:
+        anchor = lifecycle_include + "\n"
+        source = replace_once_or_present(
+            source, anchor, anchor + lifecycle_state_include + "\n",
+            f"{rel_cc}: lifecycle discard reason include",
+        )
 
     enabled_marker = "PORTABLE_UI_DISCARD_ENABLED_CASES"
-    enabled_anchor = """    case CommandReload:
-      return delegate_->CanReload();
-"""
-    enabled_cases = """    case CommandPortableDiscardTab: {
-      // The command always refers to the tab that was right-clicked.
-      if (!performance_manager::PerformanceManager::IsAvailable() ||
-          !ContainsIndex(context_index)) {
+    enabled_cases = '''    // PORTABLE_UI_DISCARD_ENABLED_CASES
+    case CommandPortableDiscardTab: {
+      if (!ContainsIndex(context_index)) {
         return false;
       }
-      // Chromium cannot discard the only active tab in a window.
+      // Chromium does not discard the only active tab in a window.
       if (active_index() == context_index && count() < 2) {
         return false;
       }
-      return !!performance_manager::PerformanceManager::GetPrimaryPageNodeForWebContents(
-          GetWebContentsAt(context_index));
+      content::WebContents* contents = GetWebContentsAt(context_index);
+      return contents &&
+             resource_coordinator::TabLifecycleUnitExternal::FromWebContents(
+                 contents);
     }
     case CommandPortableDiscardOthers: {
-      if (!performance_manager::PerformanceManager::IsAvailable() ||
-          !ContainsIndex(context_index) || count() < 2) {
+      if (!ContainsIndex(context_index) || count() < 2) {
         return false;
       }
       for (int candidate = 0; candidate < count(); ++candidate) {
         if (candidate == context_index) {
           continue;
         }
-        if (performance_manager::PerformanceManager::GetPrimaryPageNodeForWebContents(
-                GetWebContentsAt(candidate))) {
+        content::WebContents* contents = GetWebContentsAt(candidate);
+        if (contents &&
+            resource_coordinator::TabLifecycleUnitExternal::FromWebContents(
+                contents)) {
           return true;
         }
       }
       return false;
     }
-"""
-    if enabled_marker not in source:
-        enabled_cases = enabled_cases.replace(
-            "    case CommandPortableDiscardTab: {",
-            "    // " + enabled_marker + "\n    case CommandPortableDiscardTab: {",
-            1,
+'''
+    if enabled_marker in source:
+        pattern = re.compile(
+            r"(?ms)^    // PORTABLE_UI_DISCARD_ENABLED_CASES\n.*?(?=^    case CommandReload:)"
         )
+        source, count = pattern.subn(enabled_cases, source, count=1)
+        if count != 1:
+            raise RuntimeError(f"{rel_cc}: could not update discard enabled-state cases")
+    else:
+        enabled_anchor = """    case CommandReload:
+      return delegate_->CanReload();
+"""
         source = replace_once_or_present(
-            source, enabled_anchor, enabled_anchor + enabled_cases,
+            source, enabled_anchor, enabled_cases + enabled_anchor,
             f"{rel_cc}: context-menu enabled-state switch",
         )
 
     execute_marker = "PORTABLE_UI_DISCARD_EXECUTE_CASES"
-    execute_anchor = """  switch (command_id) {
-    case CommandNewTabToRight: {
-"""
-    execute_cases = """  switch (command_id) {
-    // PORTABLE_UI_DISCARD_EXECUTE_CASES
+    execute_cases = '''    // PORTABLE_UI_DISCARD_EXECUTE_CASES
     case CommandPortableDiscardTab: {
-      if (!ContainsIndex(context_index) ||
-          !performance_manager::PerformanceManager::IsAvailable()) {
+      if (!ContainsIndex(context_index)) {
         break;
       }
 
-      // Discarding an active tab is not supported by Chromium's lifecycle
-      // manager. Move to a neighboring tab first, then discard the clicked tab.
+      // The clicked tab is the target even when it is currently active.
+      // Switch away first because Chromium cannot discard the active tab.
       if (active_index() == context_index) {
         if (count() < 2) {
           break;
@@ -213,85 +220,62 @@ def apply_tab_discard(root: Path) -> None:
       }
 
       if (content::WebContents* contents = GetWebContentsAt(context_index)) {
-        auto page_node =
-            performance_manager::PerformanceManager::GetPrimaryPageNodeForWebContents(
-                contents);
-        if (page_node) {
-          performance_manager::user_tuning::DiscardPage(
-              page_node.get(), ::mojom::LifecycleUnitDiscardReason::EXTERNAL,
-              /*ignore_minimum_time_in_background=*/true);
+        if (auto* lifecycle_unit =
+                resource_coordinator::TabLifecycleUnitExternal::FromWebContents(
+                    contents)) {
+          lifecycle_unit->DiscardTab(
+              ::mojom::LifecycleUnitDiscardReason::EXTERNAL);
         }
       }
       break;
     }
 
     case CommandPortableDiscardOthers: {
-      if (!ContainsIndex(context_index) || count() < 2 ||
-          !performance_manager::PerformanceManager::IsAvailable()) {
+      if (!ContainsIndex(context_index) || count() < 2) {
         break;
       }
 
-      // Keep the right-clicked tab as the selected tab. Every other tab is
-      // therefore in the background before the discard requests are issued.
+      // Keep the tab that was right-clicked selected; unload every other tab.
       if (active_index() != context_index) {
         ActivateTabAt(context_index, TabStripUserGestureDetails(
             TabStripUserGestureDetails::GestureType::kNone));
       }
 
-      // Iterate by index; discarding does not remove tabs from the strip.
+      // Discarding preserves tab-strip indices because tabs remain open.
       for (int candidate = count() - 1; candidate >= 0; --candidate) {
         if (candidate == context_index) {
           continue;
         }
-        content::WebContents* contents = GetWebContentsAt(candidate);
-        if (!contents) {
-          continue;
-        }
-        auto page_node =
-            performance_manager::PerformanceManager::GetPrimaryPageNodeForWebContents(
-                contents);
-        if (page_node) {
-          performance_manager::user_tuning::DiscardPage(
-              page_node.get(), ::mojom::LifecycleUnitDiscardReason::EXTERNAL,
-              /*ignore_minimum_time_in_background=*/true);
+        if (content::WebContents* contents = GetWebContentsAt(candidate)) {
+          if (auto* lifecycle_unit =
+                  resource_coordinator::TabLifecycleUnitExternal::FromWebContents(
+                      contents)) {
+            lifecycle_unit->DiscardTab(
+                ::mojom::LifecycleUnitDiscardReason::EXTERNAL);
+          }
         }
       }
       break;
     }
-
+'''
+    if execute_marker in source:
+        pattern = re.compile(
+            r"(?ms)^    // PORTABLE_UI_DISCARD_EXECUTE_CASES\n.*?(?=^    case CommandNewTabToRight:)"
+        )
+        source, count = pattern.subn(execute_cases, source, count=1)
+        if count != 1:
+            raise RuntimeError(f"{rel_cc}: could not update discard execution cases")
+    else:
+        execute_anchor = """  switch (command_id) {
     case CommandNewTabToRight: {
 """
-    if execute_marker not in source:
         source = replace_once_or_present(
-            source, execute_anchor, execute_cases,
+            source, execute_anchor,
+            "  switch (command_id) {\n" + execute_cases + "    case CommandNewTabToRight: {\n",
             f"{rel_cc}: context-menu execution switch",
         )
-
-    # Chromium 141 changed ActivateTabAt's second parameter from bool to
-    # TabStripUserGestureDetails. Convert the two synthetic non-user activations
-    # both on a clean tree and on a tree where an older version of this
-    # post-processor already inserted its marked command block.
-    gesture_replacements = {
-        "ActivateTabAt(replacement_index, /*user_gesture=*/false);":
-            "ActivateTabAt(replacement_index, TabStripUserGestureDetails(\n"
-            "            TabStripUserGestureDetails::GestureType::kNone));",
-        "ActivateTabAt(context_index, /*user_gesture=*/false);":
-            "ActivateTabAt(context_index, TabStripUserGestureDetails(\n"
-            "            TabStripUserGestureDetails::GestureType::kNone));",
-    }
-    for old_call, new_call in gesture_replacements.items():
-        if old_call in source:
-            if source.count(old_call) != 1:
-                raise RuntimeError(
-                    f"{rel_cc}: expected one outdated activation call {old_call!r}, "
-                    f"found {source.count(old_call)}"
-                )
-            source = source.replace(old_call, new_call, 1)
-
     write_if_changed(path_cc, path_cc.read_text(encoding="utf-8"), source)
 
-    # Add both entries together to every normal tab context menu. They are not
-    # conditionally renamed based on which tab is currently active.
     rel_menu = "chrome/browser/ui/tabs/tab_menu_model.cc"
     path_menu, menu = read_text(root, rel_menu)
     menu_marker = "PORTABLE_UI_TAB_DISCARD_MENU_ITEMS"
@@ -316,8 +300,9 @@ def apply_tab_discard(root: Path) -> None:
         )
     write_if_changed(path_menu, path_menu.read_text(encoding="utf-8"), menu)
 
-    # tab_strip_model.cc is compiled by tab_strip_impl. This single dependency
-    # exposes the user-tuning discard API, PerformanceManager, and lifecycle mojom.
+    # The target already depends on chrome/browser public dependencies, which
+    # expose the tab lifecycle API. Keep the previous explicit user_tuning dep
+    # intact for compatibility with existing source checkpoints.
     rel_gn = "chrome/browser/ui/tabs/BUILD.gn"
     path_gn, gn = read_text(root, rel_gn)
     target_start = gn.find('  source_set("tab_strip_impl") {')
@@ -339,6 +324,125 @@ def apply_tab_discard(root: Path) -> None:
     write_if_changed(path_gn, path_gn.read_text(encoding="utf-8"), gn)
 
 
+def apply_hovercard_overrides(root: Path) -> None:
+    rel = "chrome/browser/ui/views/tabs/tab_hover_card_bubble_view.cc"
+    path, source = read_text(root, rel)
+
+    alert_include = '#include "components/tabs/public/tab_alert.h"'
+    if alert_include not in source:
+        anchor = '#include "components/url_formatter/url_formatter.h"\n'
+        source = replace_once_or_present(
+            source, anchor, alert_include + "\n" + anchor,
+            f"{rel}: TabAlert definition include",
+        )
+
+    alert_marker = "PORTABLE_UI_HIDE_HOVERCARD_AUDIO"
+    alert_anchor = "    alert_state_ = Tab::GetAlertStateToShow(tab_data.alert_state);"
+    if alert_marker not in source:
+        alert_block = alert_anchor + """
+    // PORTABLE_UI_HIDE_HOVERCARD_AUDIO: hide the audio activity footer only.
+    if (alert_state_ == tabs::TabAlert::kAudioPlaying ||
+        alert_state_ == tabs::TabAlert::kAudioMuting) {
+      alert_state_.reset();
+    }
+"""
+        source = replace_once_or_present(
+            source, alert_anchor, alert_block, f"{rel}: hover-card audio state"
+        )
+
+    memory_marker = "// PORTABLE_UI_HIDE_HOVERCARD_MEMORY"
+    memory_pattern = re.compile(
+        r"(?ms)^(?P<indent>[ \t]*)const base::ByteCount tab_memory_usage =.*?"
+        r"^(?P=indent)const bool show_footer ="
+    )
+    if memory_marker not in source:
+        replacement = lambda m: (
+            f"{m.group('indent')}{memory_marker}\n"
+            f"{m.group('indent')}const bool show_memory_usage = false;\n\n"
+            f"{m.group('indent')}const bool show_footer ="
+        )
+        source, count = memory_pattern.subn(replacement, source, count=1)
+        if count != 1:
+            raise RuntimeError(f"{rel}: could not locate the hover-card memory calculation block")
+    else:
+        # Normalize any previous memory block as well as making repeat runs safe.
+        replacement = lambda m: (
+            f"{m.group('indent')}{memory_marker}\n"
+            f"{m.group('indent')}const bool show_memory_usage = false;\n\n"
+            f"{m.group('indent')}const bool show_footer ="
+        )
+        source, count = memory_pattern.subn(replacement, source, count=1)
+        if count == 0 and not re.search(
+            r"(?m)^\s*const bool show_memory_usage = false;", source
+        ):
+            raise RuntimeError(f"{rel}: memory-hiding marker exists without disabled memory state")
+
+    old_alert_data = """  footer_view_->SetAlertData(
+      {alert_state_, show_discard_status, tab_data.discarded_memory_savings});
+"""
+    new_alert_data = """  footer_view_->SetAlertData(
+      {alert_state_, show_discard_status, base::ByteCount(0)});
+"""
+    source = replace_once_or_present(
+        source, old_alert_data, new_alert_data, f"{rel}: memory savings footer data"
+    )
+
+    old_performance_data = """  footer_view_->SetPerformanceData(
+      {show_memory_usage, is_high_memory_usage, tab_memory_usage});
+"""
+    new_performance_data = """  footer_view_->SetPerformanceData(
+      {false, false, base::ByteCount(0)});
+"""
+    source = replace_once_or_present(
+        source, old_performance_data, new_performance_data,
+        f"{rel}: hover-card performance footer data",
+    )
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+
+def apply_task_manager_stable_order(root: Path) -> None:
+    rel = "chrome/browser/ui/views/task_manager_view.cc"
+    path, source = read_text(root, rel)
+
+    # Avoid default CPU sorting, which makes rows jump as usage is sampled.
+    source = replace_once_or_present(
+        source,
+        ".sort_on_cpu_by_default = tm_refresh_enabled,",
+        ".sort_on_cpu_by_default = false,",
+        f"{rel}: default sort",
+    )
+
+    stable_marker = "// PORTABLE_UI_TASK_MANAGER_STABLE_ORDER"
+    if stable_marker not in source:
+        anchor = """  table_model_->RetrieveSavedColumnsSettingsAndUpdateTable(
+      table_config_.sort_on_cpu_by_default);
+"""
+        replacement = anchor + """  // PORTABLE_UI_TASK_MANAGER_STABLE_ORDER
+  // Ignore a previously saved metric sort when opening Task Manager.
+  tab_table_->SetSortDescriptors({});
+"""
+        source = replace_once_or_present(
+            source, anchor, replacement, f"{rel}: reset saved dynamic sort"
+        )
+
+    fixed_marker = "PORTABLE_UI_TASK_MANAGER_FIXED_ORDER"
+    if fixed_marker not in source:
+        method_pattern = re.compile(
+            r"(?ms)^void TaskManagerView::SetSortDescriptor\("
+            r"const TableSortDescriptor& descriptor\) \{.*?^\}"
+        )
+        fixed_method = """void TaskManagerView::SetSortDescriptor(const TableSortDescriptor&) {
+  // PORTABLE_UI_TASK_MANAGER_FIXED_ORDER: keep the model's process/task order.
+  tab_table_->SetSortDescriptors({});
+}"""
+        source, count = method_pattern.subn(fixed_method, source, count=1)
+        if count != 1:
+            raise RuntimeError(
+                f"{rel}: could not lock Task Manager to the stable process/task order"
+            )
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+
 def main() -> int:
     try:
         if len(sys.argv) != 2:
@@ -349,9 +453,11 @@ def main() -> int:
         apply_menu_density(root)
         apply_app_menu_density(root)
         apply_tab_discard(root)
+        apply_hovercard_overrides(root)
+        apply_task_manager_stable_order(root)
         print(
-            "Applied compact menu metrics and two clicked-tab discard commands "
-            "(discard clicked tab / discard all other tabs)."
+            "Applied compact menu spacing, lifecycle-managed clicked-tab discard, "
+            "clean hover cards and stable Task Manager ordering."
         )
         return 0
     except Exception as exc:
