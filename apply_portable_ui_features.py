@@ -328,7 +328,7 @@ def apply_hovercard_overrides(root: Path) -> None:
     rel = "chrome/browser/ui/views/tabs/tab_hover_card_bubble_view.cc"
     path, source = read_text(root, rel)
 
-    alert_include = '#include "components/tabs/public/tab_alert.h"'
+    alert_include = '#include "chrome/browser/ui/tabs/alert/tab_alert.h"'
     if alert_include not in source:
         anchor = '#include "components/url_formatter/url_formatter.h"\n'
         source = replace_once_or_present(
@@ -341,8 +341,8 @@ def apply_hovercard_overrides(root: Path) -> None:
     if alert_marker not in source:
         alert_block = alert_anchor + """
     // PORTABLE_UI_HIDE_HOVERCARD_AUDIO: hide the audio activity footer only.
-    if (alert_state_ == tabs::TabAlert::kAudioPlaying ||
-        alert_state_ == tabs::TabAlert::kAudioMuting) {
+    if (alert_state_ == tabs::TabAlert::AUDIO_PLAYING ||
+        alert_state_ == tabs::TabAlert::AUDIO_MUTING) {
       alert_state_.reset();
     }
 """
