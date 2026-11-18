@@ -1001,6 +1001,20 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
 
     execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
     if execute_marker not in source:
+        # The same case label is intentionally present in both ExecuteCommand()
+        # and IsCommandIdEnabled(). Insert the command handler only in the former;
+        # a file-wide replacement incorrectly sees two matches and aborts build-1.
+        execute_sig = (
+            "void BookmarkContextMenuController::ExecuteCommand(int id, int event_flags) {\n"
+        )
+        execute_start = source.find(execute_sig)
+        if execute_start < 0:
+            raise RuntimeError(f"{rel}: ExecuteCommand method not found")
+        next_method_sig = "\nbool BookmarkContextMenuController::IsCommandIdChecked"
+        execute_end = source.find(next_method_sig, execute_start + len(execute_sig))
+        if execute_end < 0:
+            raise RuntimeError(f"{rel}: end of ExecuteCommand method not found")
+        execute_block = source[execute_start:execute_end]
         anchor = "    case IDC_BOOKMARK_BAR_ALWAYS_SHOW:\n"
         addition = '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE
     case IDC_BOOKMARK_BAR_AUTO_HIDE: {
@@ -1015,7 +1029,11 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
       break;
     }
 '''
-        source = replace_once_or_present(source, anchor, addition + anchor, rel)
+        execute_block = replace_once_or_present(
+            execute_block, anchor, addition + anchor,
+            f"{rel}: ExecuteCommand bookmark-bar toggle case",
+        )
+        source = source[:execute_start] + execute_block + source[execute_end:]
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
     rel = "chrome/browser/ui/views/bookmarks/bookmark_context_menu.h"
