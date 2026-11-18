@@ -134,7 +134,11 @@ def apply_tab_discard(root: Path) -> None:
     # The source-side wrapper lets the UI use Chromium's normal safety policy.
     rel_source_h = "chrome/browser/resource_coordinator/tab_lifecycle_unit_source.h"
     path_source_h, source_h = read_text(root, rel_source_h)
-    can_discard_decl = "  static bool CanDiscardTab(content::WebContents* web_contents);"
+    can_discard_decl = (
+        "  static bool CanDiscardTab(\n"
+        "      content::WebContents* web_contents,\n"
+        "      bool* blocked_only_by_visibility = nullptr);"
+    )
     if can_discard_decl not in source_h:
         getter_decl = (
             "  static TabLifecycleUnitExternal* GetTabLifecycleUnitExternal(\n"
@@ -156,6 +160,13 @@ def apply_tab_discard(root: Path) -> None:
 
     rel_source_cc = "chrome/browser/resource_coordinator/tab_lifecycle_unit_source.cc"
     path_source_cc, source_cc = read_text(root, rel_source_cc)
+    decision_details_include = '#include "chrome/browser/resource_coordinator/decision_details.h"\n'
+    if decision_details_include not in source_cc:
+        source_header = '#include "chrome/browser/resource_coordinator/tab_lifecycle_unit_source.h"\n'
+        source_cc = replace_once_or_present(
+            source_cc, source_header, source_header + decision_details_include,
+            f"{rel_source_cc}: DecisionDetails include",
+        )
     can_discard_marker = "PORTABLE_UI_CAN_DISCARD_TAB_HELPER"
     if can_discard_marker not in source_cc:
         getter_impl = (
@@ -186,14 +197,25 @@ def apply_tab_discard(root: Path) -> None:
         can_discard_impl = getter_impl + (
             "\n// PORTABLE_UI_CAN_DISCARD_TAB_HELPER\n"
             "bool TabLifecycleUnitSource::CanDiscardTab(\n"
-            "    content::WebContents* web_contents) {\n"
+            "    content::WebContents* web_contents,\n"
+            "    bool* blocked_only_by_visibility) {\n"
+            "  if (blocked_only_by_visibility) {\n"
+            "    *blocked_only_by_visibility = false;\n"
+            "  }\n"
             "  auto* lifecycle_unit = GetTabLifecycleUnit(web_contents);\n"
             "  if (!lifecycle_unit) {\n"
             "    return false;\n"
             "  }\n"
             "  DecisionDetails decision_details;\n"
-            "  return lifecycle_unit->CanDiscard(LifecycleUnitDiscardReason::PROACTIVE,\n"
-            "                                    &decision_details);\n"
+            "  const bool can_discard = lifecycle_unit->CanDiscard(\n"
+            "      LifecycleUnitDiscardReason::PROACTIVE, &decision_details);\n"
+            "  if (blocked_only_by_visibility && !can_discard &&\n"
+            "      decision_details.reasons().size() == 1 &&\n"
+            "      decision_details.FailureReason() ==\n"
+            "          DecisionFailureReason::LIVE_STATE_VISIBLE) {\n"
+            "    *blocked_only_by_visibility = true;\n"
+            "  }\n"
+            "  return can_discard;\n"
             "}\n"
         )
         source_cc = source_cc.replace(getter_impl, can_discard_impl, 1)
@@ -203,6 +225,7 @@ def apply_tab_discard(root: Path) -> None:
     path_cc, source = read_text(root, rel_cc)
 
     includes = [
+        '#include "chrome/browser/resource_coordinator/decision_details.h"',
         '#include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"',
         '#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"',
         '#include "chrome/browser/resource_coordinator/tab_lifecycle_unit_source.h"',
@@ -302,10 +325,25 @@ def apply_tab_discard(root: Path) -> None:
         break;
       }
 
-      // The clicked tab is the target even when it is currently active.
-      // Switch away first because Chromium cannot proactively discard a visible tab.
-      if (active_index() == context_index) {
-        if (count() < 2) {
+      const bool target_was_active = active_index() == context_index;
+      if (target_was_active && count() < 2) {
+        break;
+      }
+
+      content::WebContents* target_contents = GetWebContentsAt(context_index);
+      if (!target_contents) {
+        break;
+      }
+
+      // Check every safety rule before changing the selection. For an active
+      // tab, switch away only when visibility is the sole reason preventing
+      // discard. Media playback, form input, capture, PDF and other protections
+      // therefore leave the currently selected tab untouched.
+      if (target_was_active) {
+        bool blocked_only_by_visibility = false;
+        resource_coordinator::TabLifecycleUnitSource::CanDiscardTab(
+            target_contents, &blocked_only_by_visibility);
+        if (!blocked_only_by_visibility) {
           break;
         }
         const int replacement_index = context_index > 0 ? context_index - 1 : 1;
@@ -313,6 +351,7 @@ def apply_tab_discard(root: Path) -> None:
             TabStripUserGestureDetails::GestureType::kNone));
       }
 
+      bool discarded = false;
       if (content::WebContents* contents = GetWebContentsAt(context_index)) {
         if (auto* lifecycle_unit =
                 resource_coordinator::TabLifecycleUnitSource::GetTabLifecycleUnitExternal(
@@ -323,7 +362,13 @@ def apply_tab_discard(root: Path) -> None:
           lifecycle_unit->DiscardTab(
               ::mojom::LifecycleUnitDiscardReason::PROACTIVE,
               GetPortableTabMemoryUsageEstimateKiB(contents));
+          discarded = true;
         }
+      }
+
+      if (target_was_active && !discarded && ContainsIndex(context_index)) {
+        ActivateTabAt(context_index, TabStripUserGestureDetails(
+            TabStripUserGestureDetails::GestureType::kNone));
       }
       break;
     }
@@ -588,6 +633,609 @@ def apply_task_manager_stable_order(root: Path) -> None:
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
 
+def apply_menu_roundness(root: Path) -> None:
+    rel = "ui/views/controls/menu/menu_config.cc"
+    path, source = read_text(root, rel)
+    marker = "PORTABLE_UI_MENU_ROUNDNESS"
+    if marker not in source:
+        old = """MenuConfig::MenuConfig() {
+  InitCommon();
+  InitPlatform();
+}"""
+        new = """MenuConfig::MenuConfig() {
+  InitCommon();
+  InitPlatform();
+  // PORTABLE_UI_MENU_ROUNDNESS: slightly reduce outer menu corner radii.
+  corner_radius = 6;
+  auxiliary_corner_radius = 5;
+  touchable_corner_radius = 6;
+}"""
+        source = replace_once_or_present(source, old, new, rel)
+    else:
+        for required in (
+            "corner_radius = 6;",
+            "auxiliary_corner_radius = 5;",
+            "touchable_corner_radius = 6;",
+        ):
+            if required not in source:
+                raise RuntimeError(f"{rel}: incomplete roundness override: {required}")
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+
+def apply_compact_toolbar(root: Path) -> None:
+    rel = "chrome/browser/ui/layout_constants.cc"
+    path, source = read_text(root, rel)
+    marker = "PORTABLE_UI_COMPACT_TOOLBAR"
+    replacements = [
+        (
+            "const int bookmark_bar_attached_vertical_margin = 6;",
+            "const int bookmark_bar_attached_vertical_margin = 5;",
+            "bookmark bar vertical margin",
+        ),
+        (
+            "case BOOKMARK_BAR_BUTTON_HEIGHT:\n      return touch_ui ? 36 : 28;",
+            "case BOOKMARK_BAR_BUTTON_HEIGHT:\n      return touch_ui ? 36 : 26;",
+            "bookmark button height",
+        ),
+        (
+            "case BOOKMARK_BAR_BUTTON_IMAGE_LABEL_PADDING:\n      return 6;",
+            "case BOOKMARK_BAR_BUTTON_IMAGE_LABEL_PADDING:\n      return 5;",
+            "bookmark icon-label gap",
+        ),
+        (
+            "case LOCATION_BAR_ELEMENT_PADDING:\n      return touch_ui ? 3 : 2;",
+            "case LOCATION_BAR_ELEMENT_PADDING:\n      return touch_ui ? 3 : 1;",
+            "location-bar element padding",
+        ),
+        (
+            "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 34;",
+            "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 33;",
+            "location-bar height",
+        ),
+        (
+            "case TOOLBAR_BUTTON_HEIGHT:\n      return touch_ui ? 48 : 34;",
+            "case TOOLBAR_BUTTON_HEIGHT:\n      return touch_ui ? 48 : 32;",
+            "toolbar button height",
+        ),
+        (
+            "case TOOLBAR_ELEMENT_PADDING:\n      return touch_ui ? 0 : 4;",
+            "case TOOLBAR_ELEMENT_PADDING:\n      return touch_ui ? 0 : 3;",
+            "toolbar element padding",
+        ),
+        (
+            "case TOOLBAR_ICON_DEFAULT_MARGIN:\n      return touch_ui ? 0 : 2;",
+            "case TOOLBAR_ICON_DEFAULT_MARGIN:\n      return touch_ui ? 0 : 1;",
+            "toolbar icon margin",
+        ),
+        (
+            "case TOOLBAR_STANDARD_SPACING:\n      return touch_ui ? 12 : 9;",
+            "case TOOLBAR_STANDARD_SPACING:\n      return touch_ui ? 12 : 8;",
+            "toolbar horizontal spacing",
+        ),
+        (
+            "case TOOLBAR_BUTTON:\n      return gfx::Insets(touch_ui ? 12 : 7);",
+            "case TOOLBAR_BUTTON:\n      return gfx::Insets(touch_ui ? 12 : 6);",
+            "toolbar button insets",
+        ),
+        (
+            "case TOOLBAR_INTERIOR_MARGIN:\n      return touch_ui ? gfx::Insets::VH(4, 0) : gfx::Insets::VH(6, 5);",
+            "case TOOLBAR_INTERIOR_MARGIN:\n      return touch_ui ? gfx::Insets::VH(4, 0) : gfx::Insets::VH(5, 4);",
+            "toolbar interior margin",
+        ),
+    ]
+    if marker not in source:
+        for old, new, label in replacements:
+            source = replace_once_or_present(source, old, new, f"{rel}: {label}")
+        anchor = "int GetLayoutConstant(LayoutConstant constant) {\n"
+        source = replace_once_or_present(
+            source,
+            anchor,
+            anchor + "  // PORTABLE_UI_COMPACT_TOOLBAR: modest desktop-only tightening.\n",
+            rel,
+        )
+    else:
+        for _old, new, label in replacements:
+            if new not in source:
+                raise RuntimeError(
+                    f"{rel}: compact toolbar marker exists but {label} is missing"
+                )
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+
+def apply_bookmark_scheme_colors(root: Path) -> None:
+    rel = "chrome/browser/ui/views/bookmarks/bookmark_bar_view.cc"
+    path, source = read_text(root, rel)
+    marker = "PORTABLE_UI_BOOKMARK_SCHEME_COLORS"
+    if marker not in source:
+        anchor = "    button->SetImageModel(views::Button::STATE_NORMAL, std::move(favicon));\n"
+        replacement = anchor + '''
+    // PORTABLE_UI_BOOKMARK_SCHEME_COLORS
+    // Give bookmarklets and data: tools a visual identity without changing
+    // ordinary bookmarks or their favicons.
+    if (node->url().SchemeIs("javascript")) {
+      constexpr SkColor kBookmarkletColor = SkColorSetRGB(80, 180, 255);
+      button->SetEnabledTextColors(kBookmarkletColor);
+      button->SetImageModel(
+          views::Button::STATE_NORMAL,
+          ui::ImageModel::FromVectorIcon(vector_icons::kCodeIcon,
+                                         kBookmarkletColor));
+    } else if (node->url().SchemeIs("data")) {
+      constexpr SkColor kDataBookmarkColor = SkColorSetRGB(255, 170, 80);
+      button->SetEnabledTextColors(kDataBookmarkColor);
+      button->SetImageModel(
+          views::Button::STATE_NORMAL,
+          ui::ImageModel::FromVectorIcon(vector_icons::kDatabaseIcon,
+                                         kDataBookmarkColor));
+    }
+'''
+        source = replace_once_or_present(source, anchor, replacement, rel)
+    else:
+        if "vector_icons::kCodeIcon" not in source or "vector_icons::kDatabaseIcon" not in source:
+            raise RuntimeError(f"{rel}: bookmark URL scheme styling block is incomplete")
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+
+def apply_data_ntp_exclusion(root: Path) -> None:
+    rel = "components/ntp_tiles/most_visited_sites.cc"
+    path, source = read_text(root, rel)
+
+    visited_marker = "PORTABLE_NTP_SKIP_DATA_MOST_VISITED"
+    if visited_marker not in source:
+        anchor = "    const history::MostVisitedURL& visited = visited_list[i];\n"
+        insert = anchor + (
+            "    // PORTABLE_NTP_SKIP_DATA_MOST_VISITED: data: pages are local tools, not shortcuts.\n"
+            "    if (visited.url.SchemeIs(\"data\"))\n"
+            "      continue;\n"
+        )
+        source = replace_once_or_present(
+            source, anchor, insert, f"{rel}: most-visited filter"
+        )
+
+    custom_marker = "PORTABLE_NTP_SKIP_DATA_CUSTOM_LINKS"
+    if custom_marker not in source:
+        anchor = "    const CustomLinksManager::Link& link = links.at(i);\n"
+        insert = anchor + (
+            "    // PORTABLE_NTP_SKIP_DATA_CUSTOM_LINKS\n"
+            "    if (link.url.SchemeIs(\"data\"))\n"
+            "      continue;\n"
+        )
+        source = replace_once_or_present(source, anchor, insert, f"{rel}: custom-link filter")
+
+    # Reject new data: URLs at the API boundary too, not only in display filtering.
+    method_specs = [
+        (
+            "bool MostVisitedSites::AddCustomLinkTo(",
+            "url",
+            "PORTABLE_NTP_REJECT_DATA_ADD_TO",
+        ),
+        (
+            "bool MostVisitedSites::AddCustomLink(",
+            "url",
+            "PORTABLE_NTP_REJECT_DATA_ADD",
+        ),
+        (
+            "bool MostVisitedSites::UpdateCustomLink(",
+            "new_url",
+            "PORTABLE_NTP_REJECT_DATA_UPDATE",
+        ),
+    ]
+    for signature, arg, marker in method_specs:
+        if re.search(rf"(?m)^\s*// {re.escape(marker)}\s*$", source):
+            continue
+        start = source.find(signature)
+        if start < 0:
+            raise RuntimeError(f"{rel}: method not found: {signature}")
+        brace = source.find("{", start)
+        if brace < 0:
+            raise RuntimeError(f"{rel}: body not found for {signature}")
+        code = (
+            f"\n  // {marker}\n"
+            f"  if ({arg}.SchemeIs(\"data\"))\n"
+            "    return false;\n"
+        )
+        source = source[: brace + 1] + code + source[brace + 1 :]
+
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+
+def apply_bookmark_bar_autohide(root: Path) -> None:
+    # Profile preference.
+    rel = "components/bookmarks/common/bookmark_pref_names.h"
+    path, source = read_text(root, rel)
+    marker = "kPortableBookmarkBarAutoHide"
+    if marker not in source:
+        anchor = 'inline constexpr char kShowBookmarkBar[] = "bookmark_bar.show_on_all_tabs";\n'
+        addition = anchor + (
+            "// Whether the bookmark bar is revealed when the pointer enters the location bar.\n"
+            "inline constexpr char kPortableBookmarkBarAutoHide[] =\n"
+            '    "bookmark_bar.portable_auto_hide";\n'
+        )
+        source = replace_once_or_present(source, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "components/bookmarks/browser/bookmark_utils.cc"
+    path, source = read_text(root, rel)
+    marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_PREF"
+    if marker not in source:
+        anchor = "  registry->RegisterBooleanPref(prefs::kEditBookmarksEnabled, true);\n"
+        addition = anchor + (
+            "  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_PREF\n"
+            "  registry->RegisterBooleanPref(prefs::kPortableBookmarkBarAutoHide, false);\n"
+        )
+        source = replace_once_or_present(source, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    # New context-menu command.
+    rel = "chrome/app/chrome_command_ids.h"
+    path, source = read_text(root, rel)
+    auto_hide_macro = re.compile(
+        r"(?m)^#define\s+IDC_BOOKMARK_BAR_AUTO_HIDE\s+(\d+)\b"
+    )
+    auto_hide_match = auto_hide_macro.search(source)
+    used_command_ids = {
+        int(value)
+        for value in re.findall(r"^#define\s+\w+\s+(\d+)\b", source, re.M)
+    }
+    if auto_hide_match:
+        current_id = int(auto_hide_match.group(1))
+        duplicate_id = re.search(
+            rf"(?m)^#define\s+(?!IDC_BOOKMARK_BAR_AUTO_HIDE\b)\w+\s+{current_id}\b",
+            source,
+        )
+        if duplicate_id:
+            available_command_ids = [
+                command_id for command_id in range(51024, 51030)
+                if command_id not in used_command_ids
+            ]
+            if not available_command_ids:
+                raise RuntimeError(f"{rel}: no unused bookmark-bar command ID in 51024-51029")
+            source = auto_hide_macro.sub(
+                f"#define IDC_BOOKMARK_BAR_AUTO_HIDE {available_command_ids[0]}",
+                source,
+                count=1,
+            )
+    else:
+        anchor = "#define IDC_BOOKMARK_BAR_OPEN_SPLIT_VIEW 51023\n"
+        available_command_ids = [
+            command_id for command_id in range(51024, 51030)
+            if command_id not in used_command_ids
+        ]
+        if not available_command_ids:
+            raise RuntimeError(f"{rel}: no unused bookmark-bar command ID in 51024-51029")
+        source = replace_once_or_present(
+            source, anchor,
+            anchor + f"#define IDC_BOOKMARK_BAR_AUTO_HIDE {available_command_ids[0]}\n", rel
+        )
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    # Pass an explicit flag through existing bookmark-menu objects. This avoids
+    # guessing whether a one-item selection means a background context menu.
+    rel = "chrome/browser/ui/bookmarks/bookmark_context_menu_controller.h"
+    path, source = read_text(root, rel)
+    old_sig = """      BookmarkLaunchLocation opened_from,
+      const std::vector<raw_ptr<const bookmarks::BookmarkNode,
+                                VectorExperimental>>& selection);"""
+    new_sig = """      BookmarkLaunchLocation opened_from,
+      const std::vector<raw_ptr<const bookmarks::BookmarkNode,
+                                VectorExperimental>>& selection,
+      bool is_bookmark_bar_background = false);"""
+    source = replace_once_or_present(source, old_sig, new_sig, rel)
+    if "is_bookmark_bar_background_" not in source:
+        anchor = "  const BookmarkLaunchLocation opened_from_;\n"
+        source = replace_once_or_present(
+            source, anchor, anchor + "  const bool is_bookmark_bar_background_;\n", rel
+        )
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/ui/bookmarks/bookmark_context_menu_controller.cc"
+    path, source = read_text(root, rel)
+    include = '#include "chrome/browser/ui/bookmarks/bookmark_bar.h"\n'
+    if include not in source:
+        anchor = '#include "chrome/browser/ui/bookmarks/bookmark_editor.h"\n'
+        source = replace_once_or_present(source, anchor, anchor + include, rel)
+
+    old_sig = """    BookmarkLaunchLocation opened_from,
+    const std::vector<raw_ptr<const BookmarkNode, VectorExperimental>>&
+        selection)
+    : parent_window_(parent_window),"""
+    new_sig = """    BookmarkLaunchLocation opened_from,
+    const std::vector<raw_ptr<const BookmarkNode, VectorExperimental>>&
+        selection,
+    bool is_bookmark_bar_background)
+    : parent_window_(parent_window),"""
+    source = replace_once_or_present(source, old_sig, new_sig, rel)
+    if "is_bookmark_bar_background_(is_bookmark_bar_background)" not in source:
+        anchor = "      opened_from_(opened_from),\n"
+        source = replace_once_or_present(
+            source,
+            anchor,
+            anchor + "      is_bookmark_bar_background_(is_bookmark_bar_background),\n",
+            rel,
+        )
+
+    menu_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_MENU_ITEM"
+    if menu_marker not in source:
+        anchor = "  AddCheckboxItem(IDC_BOOKMARK_BAR_ALWAYS_SHOW, IDS_SHOW_BOOKMARK_BAR);\n"
+        addition = anchor + '''
+  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_MENU_ITEM
+  if (is_bookmark_bar_background_) {
+    AddSeparator();
+    menu_model_->AddCheckItem(
+        IDC_BOOKMARK_BAR_AUTO_HIDE, u"Автоскрытие панели закладок");
+  }
+'''
+        source = replace_once_or_present(source, anchor, addition, rel)
+
+    checked_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_CHECKED"
+    if checked_marker not in source:
+        sig = "bool BookmarkContextMenuController::IsCommandIdChecked(int command_id) const {\n"
+        start = source.find(sig)
+        if start < 0:
+            raise RuntimeError(f"{rel}: IsCommandIdChecked not found")
+        anchor = "  PrefService* prefs = profile_->GetPrefs();\n"
+        pos = source.find(anchor, start)
+        if pos < 0:
+            raise RuntimeError(f"{rel}: PrefService anchor missing in IsCommandIdChecked")
+        addition = anchor + (
+            "  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_CHECKED\n"
+            "  if (command_id == IDC_BOOKMARK_BAR_AUTO_HIDE) {\n"
+            "    return prefs->GetBoolean(bookmarks::prefs::kPortableBookmarkBarAutoHide);\n"
+            "  }\n"
+        )
+        source = source[:pos] + addition + source[pos + len(anchor) :]
+
+    enabled_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_ENABLED"
+    if enabled_marker not in source:
+        sig = "bool BookmarkContextMenuController::IsCommandIdEnabled(int command_id) const {\n"
+        pos = source.find(sig)
+        if pos < 0:
+            raise RuntimeError(f"{rel}: IsCommandIdEnabled not found")
+        brace = pos + len(sig)
+        code = (
+            "  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_ENABLED\n"
+            "  if (command_id == IDC_BOOKMARK_BAR_AUTO_HIDE) {\n"
+            "    return is_bookmark_bar_background_;\n"
+            "  }\n"
+        )
+        source = source[:brace] + code + source[brace:]
+
+    execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
+    if execute_marker not in source:
+        anchor = "    case IDC_BOOKMARK_BAR_ALWAYS_SHOW:\n"
+        addition = '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE
+    case IDC_BOOKMARK_BAR_AUTO_HIDE: {
+      PrefService* prefs = profile_->GetPrefs();
+      prefs->SetBoolean(
+          bookmarks::prefs::kPortableBookmarkBarAutoHide,
+          !prefs->GetBoolean(bookmarks::prefs::kPortableBookmarkBarAutoHide));
+      if (browser_) {
+        browser_->window()->BookmarkBarStateChanged(
+            BookmarkBar::ANIMATE_STATE_CHANGE);
+      }
+      break;
+    }
+'''
+        source = replace_once_or_present(source, anchor, addition + anchor, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/ui/views/bookmarks/bookmark_context_menu.h"
+    path, source = read_text(root, rel)
+    old_sig = """                      const std::vector<raw_ptr<const bookmarks::BookmarkNode,
+                                                VectorExperimental>>& selection,
+                      bool close_on_remove);"""
+    new_sig = """                      const std::vector<raw_ptr<const bookmarks::BookmarkNode,
+                                                VectorExperimental>>& selection,
+                      bool close_on_remove,
+                      bool is_bookmark_bar_background = false);"""
+    source = replace_once_or_present(source, old_sig, new_sig, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/ui/views/bookmarks/bookmark_context_menu.cc"
+    path, source = read_text(root, rel)
+    old_sig = """    const std::vector<raw_ptr<const BookmarkNode, VectorExperimental>>&
+        selection,
+    bool close_on_remove)
+    : controller_(new BookmarkContextMenuController("""
+    new_sig = """    const std::vector<raw_ptr<const BookmarkNode, VectorExperimental>>&
+        selection,
+    bool close_on_remove,
+    bool is_bookmark_bar_background)
+    : controller_(new BookmarkContextMenuController("""
+    source = replace_once_or_present(source, old_sig, new_sig, rel)
+    anchor = "          opened_from,\n          selection)),\n"
+    addition = "          opened_from,\n          selection,\n          is_bookmark_bar_background)),\n"
+    source = replace_once_or_present(source, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/ui/views/bookmarks/bookmark_bar_view.cc"
+    path, source = read_text(root, rel)
+    call_anchor = """      BookmarkLaunchLocation::kAttachedBar, ToRawPtrVector(nodes),
+      close_on_remove);"""
+    call_new = """      BookmarkLaunchLocation::kAttachedBar, ToRawPtrVector(nodes),
+      close_on_remove, source == this);"""
+    source = replace_once_or_present(source, call_anchor, call_new, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    # Listen to window mouse movement before normal dispatch.
+    rel = "chrome/browser/ui/views/frame/browser_view.h"
+    path, source = read_text(root, rel)
+    include = '#include "ui/events/event_handler.h"\n'
+    if include not in source:
+        anchor = '#include "ui/views/window/client_view.h"\n'
+        source = replace_once_or_present(source, anchor, include + anchor, rel)
+    if "public ui::EventHandler," not in source:
+        source = replace_once_or_present(
+            source,
+            "                    public views::ClientView,\n",
+            "                    public views::ClientView,\n                    public ui::EventHandler,\n",
+            rel,
+        )
+    if "void OnMouseEvent(ui::MouseEvent* event) override;" not in source:
+        anchor = "  void BookmarkBarStateChanged(\n      BookmarkBar::AnimateChangeType change_type) override;\n"
+        source = replace_once_or_present(
+            source, anchor,
+            anchor + "  void OnMouseEvent(ui::MouseEvent* event) override;\n", rel
+        )
+    if "class EventTarget;" not in source:
+        anchor = "namespace ui {\nclass NativeTheme;\n}  // namespace ui\n"
+        source = replace_once_or_present(
+            source, anchor,
+            "namespace ui {\nclass EventTarget;\nclass NativeTheme;\n}  // namespace ui\n", rel
+        )
+    if "portable_bookmark_bar_event_target_" not in source:
+        anchor = "  bool initialized_ = false;\n"
+        members = (
+            "  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_STATE\n"
+            "  raw_ptr<ui::EventTarget> portable_bookmark_bar_event_target_ = nullptr;\n"
+            "  bool portable_bookmark_bar_revealed_ = false;\n"
+        )
+        source = replace_once_or_present(source, anchor, members + anchor, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/ui/views/frame/browser_view.cc"
+    path, source = read_text(root, rel)
+    for include in (
+        '#include "components/bookmarks/common/bookmark_pref_names.h"',
+        '#include "ui/events/event.h"',
+        '#include "ui/events/event_target.h"',
+    ):
+        if include not in source:
+            anchor = '#include "chrome/browser/profiles/profile.h"\n'
+            source = replace_once_or_present(source, anchor, anchor + include + "\n", rel)
+
+    event_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_MOUSE_EVENT"
+    if event_marker not in source:
+        anchor = "void BrowserView::AddedToWidget() {\n"
+        code = '''void BrowserView::OnMouseEvent(ui::MouseEvent* event) {
+  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_MOUSE_EVENT
+  if (!event || (event->type() != ui::ET_MOUSE_MOVED &&
+                 event->type() != ui::ET_MOUSE_ENTERED)) {
+    return;
+  }
+  if (!browser_ || !bookmark_bar_view_ ||
+      !browser_->GetProfile()->GetPrefs()->GetBoolean(
+          bookmarks::prefs::kPortableBookmarkBarAutoHide) ||
+      bookmark_bar_state() != BookmarkBar::SHOW || !event->target()) {
+    return;
+  }
+
+  const gfx::Point screen_point =
+      event->target()->GetScreenLocation(*event);
+  bool should_reveal = portable_bookmark_bar_revealed_;
+  LocationBarView* location_bar = GetLocationBarView();
+  if (!should_reveal && location_bar &&
+      location_bar->GetBoundsInScreen().Contains(screen_point)) {
+    should_reveal = true;
+  } else if (should_reveal &&
+             screen_point.y() > bookmark_bar_view_->GetBoundsInScreen().bottom()) {
+    should_reveal = false;
+  }
+
+  if (should_reveal == portable_bookmark_bar_revealed_) {
+    return;
+  }
+  portable_bookmark_bar_revealed_ = should_reveal;
+  bookmark_bar_view_->SetBookmarkBarState(
+      should_reveal ? BookmarkBar::SHOW : BookmarkBar::HIDDEN,
+      BookmarkBar::ANIMATE_STATE_CHANGE);
+  InvalidateLayout();
+}
+
+'''
+        source = replace_once_or_present(source, anchor, code + anchor, rel)
+
+    reg_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_REGISTER"
+    if reg_marker not in source:
+        anchor = "void BrowserView::AddedToWidget() {\n"
+        addition = '''void BrowserView::AddedToWidget() {
+  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_REGISTER
+  if (!portable_bookmark_bar_event_target_ && GetWidget() &&
+      GetWidget()->GetNativeView()) {
+    portable_bookmark_bar_event_target_ = GetWidget()->GetNativeView();
+    portable_bookmark_bar_event_target_->AddPreTargetHandler(this);
+  }
+'''
+        source = replace_once_or_present(source, anchor, addition, rel)
+
+    unreg_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_UNREGISTER"
+    if unreg_marker not in source:
+        anchor = "void BrowserView::RemovedFromWidget() {\n"
+        addition = '''void BrowserView::RemovedFromWidget() {
+  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_UNREGISTER
+  if (portable_bookmark_bar_event_target_) {
+    portable_bookmark_bar_event_target_->RemovePreTargetHandler(this);
+    portable_bookmark_bar_event_target_ = nullptr;
+  }
+'''
+        source = replace_once_or_present(source, anchor, addition, rel)
+
+    # Respect the normal preference and state when tabs change or the view is created.
+    state_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_STATE_CHANGED"
+    if state_marker not in source:
+        anchor = "    BookmarkBar::State new_state = bookmark_bar_state();\n"
+        addition = anchor + '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_STATE_CHANGED
+    const bool auto_hide_bookmark_bar = browser_->GetProfile()->GetPrefs()->GetBoolean(
+        bookmarks::prefs::kPortableBookmarkBarAutoHide);
+    if (!auto_hide_bookmark_bar || new_state != BookmarkBar::SHOW) {
+      portable_bookmark_bar_revealed_ = false;
+    }
+    if (auto_hide_bookmark_bar && new_state == BookmarkBar::SHOW &&
+        !portable_bookmark_bar_revealed_) {
+      new_state = BookmarkBar::HIDDEN;
+    }
+'''
+        source = replace_once_or_present(source, anchor, addition, rel)
+
+    tab_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_TAB_CHANGE"
+    initial_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_INITIAL_STATE"
+    anchor = '''    bookmark_bar_view_->SetBookmarkBarState(
+        bookmark_bar_state(), BookmarkBar::DONT_ANIMATE_STATE_CHANGE);
+'''
+    if tab_marker not in source and initial_marker not in source:
+        # Chromium 141 contains the same statement in both OnActiveTabChanged()
+        # and MaybeShowBookmarkBar(). Replace in source order, preserving each
+        # location's unique marker for safe reruns.
+        count = source.count(anchor)
+        if count != 2:
+            raise RuntimeError(
+                f"{rel}: expected two bookmark-bar state anchors, found {count}"
+            )
+        tab_addition = '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_TAB_CHANGE
+    BookmarkBar::State new_bookmark_state = bookmark_bar_state();
+    const bool auto_hide_bookmark_bar = browser_->GetProfile()->GetPrefs()->GetBoolean(
+        bookmarks::prefs::kPortableBookmarkBarAutoHide);
+    if (!auto_hide_bookmark_bar || new_bookmark_state != BookmarkBar::SHOW) {
+      portable_bookmark_bar_revealed_ = false;
+    }
+    if (auto_hide_bookmark_bar && new_bookmark_state == BookmarkBar::SHOW &&
+        !portable_bookmark_bar_revealed_) {
+      new_bookmark_state = BookmarkBar::HIDDEN;
+    }
+    bookmark_bar_view_->SetBookmarkBarState(
+        new_bookmark_state, BookmarkBar::DONT_ANIMATE_STATE_CHANGE);
+'''
+        initial_addition = '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_INITIAL_STATE
+    BookmarkBar::State initial_bookmark_state = bookmark_bar_state();
+    const bool auto_hide_bookmark_bar = browser_->GetProfile()->GetPrefs()->GetBoolean(
+        bookmarks::prefs::kPortableBookmarkBarAutoHide);
+    if (!auto_hide_bookmark_bar || initial_bookmark_state != BookmarkBar::SHOW) {
+      portable_bookmark_bar_revealed_ = false;
+    }
+    if (auto_hide_bookmark_bar && initial_bookmark_state == BookmarkBar::SHOW &&
+        !portable_bookmark_bar_revealed_) {
+      initial_bookmark_state = BookmarkBar::HIDDEN;
+    }
+    bookmark_bar_view_->SetBookmarkBarState(
+        initial_bookmark_state, BookmarkBar::DONT_ANIMATE_STATE_CHANGE);
+'''
+        source = source.replace(anchor, tab_addition, 1)
+        source = source.replace(anchor, initial_addition, 1)
+    elif tab_marker in source and initial_marker in source:
+        pass
+    else:
+        raise RuntimeError(f"{rel}: partial bookmark-bar auto-hide state patch")
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
 def main() -> int:
     try:
         if len(sys.argv) != 2:
@@ -596,14 +1244,20 @@ def main() -> int:
         if not (root / "chrome/browser/ui/tabs/tab_strip_model.cc").is_file():
             raise RuntimeError(f"Not a Chromium source tree: {root}")
         apply_menu_density(root)
+        apply_menu_roundness(root)
         apply_app_menu_density(root)
+        apply_compact_toolbar(root)
         apply_tab_discard(root)
         apply_web_contents_discard(root)
         apply_hovercard_overrides(root)
         apply_task_manager_stable_order(root)
+        apply_bookmark_scheme_colors(root)
+        apply_data_ntp_exclusion(root)
+        apply_bookmark_bar_autohide(root)
         print(
-            "Applied compact menus, native proactive tab discard, discarded-only hover-card "
-            "changes, retained WebContents tracking and stable Task Manager ordering."
+            "Applied compact UI, native proactive discard, discarded-only hover-card "
+            "details, stable Task Manager ordering, bookmark URL styling, data-URL "
+            "NTP filtering and optional bookmark-bar auto-hide."
         )
         return 0
     except Exception as exc:
