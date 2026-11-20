@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the existing portable OSCrypt/device-ID steps plus optional UI step."""
+"""Install the portable OSCrypt, device-ID and UI steps into the build copy."""
 from __future__ import annotations
 
 import os
@@ -13,6 +13,7 @@ HOOK_BLOCK = '''        # PORTABLE_OSCRYPT_POST_PATCH_HOOK
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_oscrypt.py'), str(source_tree)], check=True)
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_device_id.py'), str(source_tree)], check=True)
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_ui_features.py'), str(source_tree)], check=True)
+        subprocess.run([sys.executable, str(_ROOT_DIR / 'fix_portable_ui_compiler.py'), str(source_tree)], check=True)
 '''
 
 
@@ -33,6 +34,7 @@ def main() -> int:
             root / "apply_portable_oscrypt.py",
             root / "apply_portable_device_id.py",
             root / "apply_portable_ui_features.py",
+            root / "fix_portable_ui_compiler.py",
         ]
         for path in required:
             if not path.is_file():
@@ -49,13 +51,11 @@ def main() -> int:
                 raise RuntimeError(
                     "Existing portable post-patch hook has no following Substitute domains marker."
                 )
-            # Replace only the previous portable hook block. The OSCrypt and
-            # device-ID processors remain in the same order and are not edited.
             source = source[:line_start] + HOOK_BLOCK + source[next_marker:]
             build_py.write_text(source, encoding="utf-8", newline="\n")
             print(
-                "Updated post-patch hook: OSCrypt, device-ID compatibility, "
-                "then compact UI/tab-discard changes."
+                "Updated post-patch hook: OSCrypt, device-ID, portable UI, "
+                "then Chromium 141 UI compile fixes."
             )
             return 0
 
@@ -67,8 +67,8 @@ def main() -> int:
         source = source.replace(SUBSTITUTE_MARKER, HOOK_BLOCK + SUBSTITUTE_MARKER, 1)
         build_py.write_text(source, encoding="utf-8", newline="\n")
         print(
-            "Installed post-patch hook: OSCrypt, device-ID compatibility, "
-            "then compact UI/tab-discard changes."
+            "Installed post-patch hook: OSCrypt, device-ID, portable UI, "
+            "then Chromium 141 UI compile fixes."
         )
         return 0
     except Exception as exc:
