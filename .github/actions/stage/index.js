@@ -6,6 +6,10 @@ const { DefaultArtifactClient } = require('@actions/artifact');
 const glob = require('@actions/glob');
 const fs = require('fs').promises;
 const path = require('path');
+const {
+  collectPortableOwnedSources,
+  findPortableOwnedSourceErrors,
+} = require('./failure_classifier');
 
 const ROOT = 'C:\\ungoogled-chromium-windows';
 const BUILD = path.join(ROOT, 'build');
@@ -97,8 +101,8 @@ async function restoreIntermediateSource(artifact, artifactName) {
 }
 
 async function createIntermediateArtifact(artifact, artifactName) {
-  // Save a resumable checkpoint after the CI time limit or a Ninja subcommand
-  // failure. Earlier preparation failures are filtered in run() before we get here.
+  // Save a resumable checkpoint after the CI time limit or a retryable Ninja
+  // failure that does not point to a source file changed by this repository.
   const requiredForResume = [
     path.join(SRC, 'BUILD.gn'),
     path.join(SRC, 'out', 'Default', 'args.gn'),
@@ -248,6 +252,7 @@ async function run() {
   console.log('[PORTABLE-LAYOUT-FIX-v2] Updated .github/actions/stage/index.js loaded.');
   console.log('[RESUMABLE-NINJA-CHECKPOINT-v1] Ninja failure recovery handler loaded.');
   console.log('[STAGE-INPUT-FIX-v1] Missing finished input safely defaults to false.');
+  console.log('[PORTABLE-PATCH-FAIL-FAST-v1] Owned-source compiler errors stop the stage chain.');
   const finishedInput = core.getInput('finished').trim();
   const finished = finishedInput === '' ? false : core.getBooleanInput('finished');
   const fromArtifact = core.getBooleanInput('from_artifact', { required: true });
@@ -283,13 +288,19 @@ async function run() {
     ignoreReturnCode: true,
   });
 
-  // Capture the end of build.py output so we can distinguish a normal CI
-  // timeout or a Ninja subcommand failure from earlier setup/patch/GN failures.
-  // Ninja failures are checkpointed and retried by the next stage: this preserves
-  // hours of completed work and allows a transient failed action to run again.
+  // Capture the end of build.py output to distinguish the CI timeout, errors in
+  // source files changed by our portable patches, and unrelated/upstream Ninja
+  // failures. Only the last category is checkpointed and retried by the next stage.
+  const ownership = await collectPortableOwnedSources(ROOT);
+  const ownedPortableSources = ownership.ownedSources;
+  console.log(`[PORTABLE-PATCH-FAIL-FAST-v1] Tracking ${ownedPortableSources.size} source file(s) from post-processors and active Windows patches.`);
+  if (!ownership.seriesPath) {
+    core.warning('Could not locate the Windows patch series file; fail-fast still tracks the portable source post-processors.');
+  }
+
   let recentBuildOutput = '';
   const rememberBuildOutput = (chunk) => {
-    recentBuildOutput = (recentBuildOutput + chunk.toString()).slice(-50000);
+    recentBuildOutput = (recentBuildOutput + chunk.toString()).slice(-200000);
   };
 
   const exitCode = await exec.exec('python', args, {
@@ -321,11 +332,27 @@ async function run() {
   }
 
   if (ninjaSubcommandFailure) {
-    core.warning(
-      'Ninja reported a failed build subcommand. Saving the current source/build state ' +
-      'so the next stage can retry the incremental build.'
+    const ownedSourceErrors = findPortableOwnedSourceErrors(
+      recentBuildOutput,
+      ownedPortableSources
     );
-    console.log('[RESUMABLE-NINJA-CHECKPOINT-v1] Saving checkpoint after Ninja subcommand failure.');
+    if (ownedSourceErrors.length) {
+      console.error('[PORTABLE-PATCH-FAIL-FAST-v1] Compiler error detected in source modified by this repository:');
+      for (const item of ownedSourceErrors) {
+        core.error(`${item.sourcePath}: ${item.diagnostic}`);
+      }
+      throw new Error(
+        `Ninja failed while compiling ${ownedSourceErrors.length} source file(s) changed by the portable-browser post-processors or Windows patches. ` +
+        'Stopping the remaining build stages now; no intermediate checkpoint will be uploaded. ' +
+        'Fix these source errors and restart the workflow from build-1.'
+      );
+    }
+
+    core.warning(
+      'Ninja failed, but the compiler diagnostics do not point to files changed by this repository. ' +
+      'Keeping the existing incremental checkpoint/retry behavior for upstream or unrelated failures.'
+    );
+    console.log('[RESUMABLE-NINJA-CHECKPOINT-v1] No portable-patch source error found; saving checkpoint for the next stage.');
   } else {
     console.log('Detected build.py CI time-limit stop; validating build state before saving intermediate source.');
   }
