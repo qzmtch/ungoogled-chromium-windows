@@ -121,6 +121,32 @@ def fix_redundant_event_handler_base(root: Path) -> None:
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
 
+
+def fix_bookmark_context_menu_browser_window(root: Path) -> None:
+    relative = "chrome/browser/ui/bookmarks/bookmark_context_menu_controller.cc"
+    path, source = read_source(root, relative)
+
+    marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
+    call = "browser_->window()->BookmarkBarStateChanged("
+    if marker not in source or call not in source:
+        raise RuntimeError(
+            f"{relative}: portable bookmark-bar auto-hide command was not found"
+        )
+
+    include = '#include "chrome/browser/ui/browser_window.h"\n'
+    if include not in source:
+        anchor = '#include "chrome/browser/ui/browser.h"\n'
+        count = source.count(anchor)
+        if count != 1:
+            raise RuntimeError(
+                f"{relative}: expected one browser.h include anchor, found {count}"
+            )
+        source = source.replace(anchor, anchor + include, 1)
+    elif source.count(include) != 1:
+        raise RuntimeError(f"{relative}: duplicate browser_window.h includes found")
+
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
 def main() -> int:
     try:
         if len(sys.argv) != 2:
@@ -130,9 +156,11 @@ def main() -> int:
         fix_bookmark_icons(root)
         fix_bookmark_bar_mouse_events(root)
         fix_redundant_event_handler_base(root)
+        fix_bookmark_context_menu_browser_window(root)
         print(
             "Applied Chromium 141 portable UI compile fixes: vector icon header, "
-            "scoped mouse event types and redundant EventHandler base cleanup."
+            "scoped mouse event types, redundant EventHandler base cleanup, "
+            "and the BrowserWindow definition include."
         )
         return 0
     except Exception as exc:
