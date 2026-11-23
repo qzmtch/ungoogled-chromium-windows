@@ -669,7 +669,7 @@ def apply_compact_toolbar(root: Path) -> None:
     replacements = [
         (
             "const int bookmark_bar_attached_vertical_margin = 6;",
-            "const int bookmark_bar_attached_vertical_margin = 5;",
+            "const int bookmark_bar_attached_vertical_margin = 2;",
             "bookmark bar vertical margin",
         ),
         (
@@ -689,7 +689,7 @@ def apply_compact_toolbar(root: Path) -> None:
         ),
         (
             "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 34;",
-            "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 33;",
+            "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 30;",
             "location-bar height",
         ),
         (
@@ -734,8 +734,25 @@ def apply_compact_toolbar(root: Path) -> None:
             rel,
         )
     else:
-        for _old, new, label in replacements:
-            if new not in source:
+        # Upgrade checkpoints produced by earlier versions of this helper.
+        legacy_upgrades = [
+            (
+                "const int bookmark_bar_attached_vertical_margin = 5;",
+                "const int bookmark_bar_attached_vertical_margin = 2;",
+                "bookmark bar vertical margin",
+            ),
+            (
+                "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 33;",
+                "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 30;",
+                "location-bar height",
+            ),
+        ]
+        for old_value, new_value, label in legacy_upgrades:
+            source = replace_once_or_present(
+                source, old_value, new_value, f"{rel}: upgrade {label}"
+            )
+        for _old, desired, label in replacements:
+            if desired not in source:
                 raise RuntimeError(
                     f"{rel}: compact toolbar marker exists but {label} is missing"
                 )
@@ -745,10 +762,69 @@ def apply_compact_toolbar(root: Path) -> None:
 def apply_bookmark_scheme_colors(root: Path) -> None:
     rel = "chrome/browser/ui/views/bookmarks/bookmark_bar_view.cc"
     path, source = read_text(root, rel)
+
+    # The generic database icon still comes from Chromium's generated icon set.
+    # The JavaScript bookmarklet uses a tiny project-local vector lettermark.
+    main_include = '#include "chrome/browser/ui/views/bookmarks/bookmark_bar_view.h"\n'
+    for include in (
+        '#include "components/vector_icons/vector_icons.h"\n',
+        '#include "ui/gfx/vector_icon_types.h"\n',
+    ):
+        if include not in source:
+            source = replace_once_or_present(
+                source, main_include, main_include + include,
+                f"{rel}: required vector icon include",
+            )
+
     marker = "PORTABLE_UI_BOOKMARK_SCHEME_COLORS"
-    if marker not in source:
-        anchor = "    button->SetImageModel(views::Button::STATE_NORMAL, std::move(favicon));\n"
-        replacement = anchor + '''
+    new_block = '''
+    // PORTABLE_UI_BOOKMARK_SCHEME_COLORS
+    // Give javascript: bookmarklets a clear "JS" lettermark. The custom path
+    // avoids Chromium's generic code/angle-bracket icon.
+    static constexpr gfx::PathElement kPortableJavascriptBookmarkPath[] = {
+        gfx::CANVAS_DIMENSIONS, 24,
+        gfx::NEW_PATH, gfx::STROKE, 2.0f,
+        gfx::MOVE_TO, 3.0f, 4.0f,
+        gfx::LINE_TO, 10.5f, 4.0f,
+        gfx::MOVE_TO, 8.5f, 4.0f,
+        gfx::LINE_TO, 8.5f, 16.0f,
+        gfx::CUBIC_TO, 8.5f, 19.0f, 6.6f, 21.0f, 4.4f, 21.0f,
+        gfx::CUBIC_TO, 2.7f, 21.0f, 1.6f, 20.0f, 1.0f, 18.2f,
+        gfx::NEW_PATH, gfx::STROKE, 2.0f,
+        gfx::MOVE_TO, 22.5f, 7.0f,
+        gfx::CUBIC_TO, 21.5f, 5.0f, 19.5f, 4.0f, 16.8f, 4.0f,
+        gfx::CUBIC_TO, 14.0f, 4.0f, 12.2f, 5.5f, 12.2f, 8.0f,
+        gfx::CUBIC_TO, 12.2f, 10.5f, 14.3f, 11.7f, 17.1f, 12.7f,
+        gfx::CUBIC_TO, 19.9f, 13.7f, 22.0f, 15.0f, 22.0f, 17.5f,
+        gfx::CUBIC_TO, 22.0f, 20.0f, 19.8f, 21.5f, 16.7f, 21.5f,
+        gfx::CUBIC_TO, 14.2f, 21.5f, 12.0f, 20.5f, 10.8f, 18.7f,
+    };
+    static const gfx::VectorIconRep kPortableJavascriptBookmarkReps[] = {
+        {kPortableJavascriptBookmarkPath,
+         sizeof(kPortableJavascriptBookmarkPath) /
+             sizeof(kPortableJavascriptBookmarkPath[0])},
+    };
+    static constexpr gfx::VectorIcon kPortableJavascriptBookmarkIcon(
+        kPortableJavascriptBookmarkReps, 1, "portable_javascript_bookmark");
+
+    if (node->url().SchemeIs("javascript")) {
+      constexpr SkColor kBookmarkletColor = SkColorSetRGB(80, 180, 255);
+      button->SetEnabledTextColors(kBookmarkletColor);
+      button->SetImageModel(
+          views::Button::STATE_NORMAL,
+          ui::ImageModel::FromVectorIcon(kPortableJavascriptBookmarkIcon,
+                                         kBookmarkletColor, 16));
+    } else if (node->url().SchemeIs("data")) {
+      constexpr SkColor kDataBookmarkColor = SkColorSetRGB(255, 170, 80);
+      button->SetEnabledTextColors(kDataBookmarkColor);
+      button->SetImageModel(
+          views::Button::STATE_NORMAL,
+          ui::ImageModel::FromVectorIcon(vector_icons::kDatabaseIcon,
+                                         kDataBookmarkColor));
+    }
+'''
+
+    old_block = '''
     // PORTABLE_UI_BOOKMARK_SCHEME_COLORS
     // Give bookmarklets and data: tools a visual identity without changing
     // ordinary bookmarks or their favicons.
@@ -768,13 +844,21 @@ def apply_bookmark_scheme_colors(root: Path) -> None:
                                          kDataBookmarkColor));
     }
 '''
-        source = replace_once_or_present(source, anchor, replacement, rel)
+
+    if marker not in source:
+        anchor = "    button->SetImageModel(views::Button::STATE_NORMAL, std::move(favicon));\n"
+        source = replace_once_or_present(
+            source, anchor, anchor + new_block, f"{rel}: bookmark scheme icon block"
+        )
+    elif "kPortableJavascriptBookmarkIcon" in source:
+        if "vector_icons::kDatabaseIcon" not in source:
+            raise RuntimeError(f"{rel}: data: bookmark icon was lost")
     else:
-        if "vector_icons::kCodeIcon" not in source or "vector_icons::kDatabaseIcon" not in source:
-            raise RuntimeError(f"{rel}: bookmark URL scheme styling block is incomplete")
+        source = replace_once_or_present(
+            source, old_block, new_block, f"{rel}: upgrade old JavaScript bookmark icon"
+        )
+
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
-
-
 def apply_data_ntp_exclusion(root: Path) -> None:
     rel = "components/ntp_tiles/most_visited_sites.cc"
     path, source = read_text(root, rel)
@@ -1001,20 +1085,6 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
 
     execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
     if execute_marker not in source:
-        # The same case label is intentionally present in both ExecuteCommand()
-        # and IsCommandIdEnabled(). Insert the command handler only in the former;
-        # a file-wide replacement incorrectly sees two matches and aborts build-1.
-        execute_sig = (
-            "void BookmarkContextMenuController::ExecuteCommand(int id, int event_flags) {\n"
-        )
-        execute_start = source.find(execute_sig)
-        if execute_start < 0:
-            raise RuntimeError(f"{rel}: ExecuteCommand method not found")
-        next_method_sig = "\nbool BookmarkContextMenuController::IsCommandIdChecked"
-        execute_end = source.find(next_method_sig, execute_start + len(execute_sig))
-        if execute_end < 0:
-            raise RuntimeError(f"{rel}: end of ExecuteCommand method not found")
-        execute_block = source[execute_start:execute_end]
         anchor = "    case IDC_BOOKMARK_BAR_ALWAYS_SHOW:\n"
         addition = '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE
     case IDC_BOOKMARK_BAR_AUTO_HIDE: {
@@ -1029,11 +1099,7 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
       break;
     }
 '''
-        execute_block = replace_once_or_present(
-            execute_block, anchor, addition + anchor,
-            f"{rel}: ExecuteCommand bookmark-bar toggle case",
-        )
-        source = source[:execute_start] + execute_block + source[execute_end:]
+        source = replace_once_or_present(source, anchor, addition + anchor, rel)
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
     rel = "chrome/browser/ui/views/bookmarks/bookmark_context_menu.h"
