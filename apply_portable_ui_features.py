@@ -1016,7 +1016,10 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
     include = '#include "chrome/browser/ui/bookmarks/bookmark_bar.h"\n'
     if include not in source:
         anchor = '#include "chrome/browser/ui/bookmarks/bookmark_editor.h"\n'
-        source = replace_once_or_present(source, anchor, anchor + include, rel)
+        source = replace_once_or_present(
+            source, anchor, anchor + include,
+            f"{rel}: include bookmark_bar.h after bookmark_editor.h",
+        )
 
     old_sig = """    BookmarkLaunchLocation opened_from,
     const std::vector<raw_ptr<const BookmarkNode, VectorExperimental>>&
@@ -1027,14 +1030,16 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
         selection,
     bool is_bookmark_bar_background)
     : parent_window_(parent_window),"""
-    source = replace_once_or_present(source, old_sig, new_sig, rel)
+    source = replace_once_or_present(
+        source, old_sig, new_sig, f"{rel}: constructor signature",
+    )
     if "is_bookmark_bar_background_(is_bookmark_bar_background)" not in source:
         anchor = "      opened_from_(opened_from),\n"
         source = replace_once_or_present(
             source,
             anchor,
             anchor + "      is_bookmark_bar_background_(is_bookmark_bar_background),\n",
-            rel,
+            f"{rel}: constructor opened_from_ initializer",
         )
 
     menu_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_MENU_ITEM"
@@ -1048,7 +1053,10 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
         IDC_BOOKMARK_BAR_AUTO_HIDE, u"Автоскрытие панели закладок");
   }
 '''
-        source = replace_once_or_present(source, anchor, addition, rel)
+        source = replace_once_or_present(
+            source, anchor, addition,
+            f"{rel}: BuildMenu auto-hide checkbox insertion",
+        )
 
     checked_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_CHECKED"
     if checked_marker not in source:
@@ -1083,8 +1091,9 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
         )
         source = source[:brace] + code + source[brace:]
 
-    execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
-        execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
+    # The ALWAYS_SHOW case exists both in ExecuteCommand() and in
+    # IsCommandIdEnabled(). Restrict the insertion to ExecuteCommand() so
+    # the second occurrence cannot make the whole-file anchor ambiguous.
     execute_signature = "void BookmarkContextMenuController::ExecuteCommand("
     execute_start = source.find(execute_signature)
     if execute_start < 0:
@@ -1098,8 +1107,11 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
     )
     if execute_end < 0:
         raise RuntimeError(f"{rel}: end of ExecuteCommand method not found")
+    if execute_end <= execute_start:
+        raise RuntimeError(f"{rel}: invalid ExecuteCommand method boundaries")
 
     execute_body = source[execute_start:execute_end]
+    execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
     if execute_marker not in execute_body:
         anchor = "    case IDC_BOOKMARK_BAR_ALWAYS_SHOW:\n"
         addition = '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE
@@ -1119,13 +1131,12 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
         if count != 1:
             raise RuntimeError(
                 f"{rel}: expected exactly one ALWAYS_SHOW case inside ExecuteCommand, "
-                f"found {count}"
+                f"found {count}; no source changes were written for this file"
             )
         execute_body = execute_body.replace(anchor, addition + anchor, 1)
         source = source[:execute_start] + execute_body + source[execute_end:]
     elif execute_body.count(execute_marker) != 1:
         raise RuntimeError(f"{rel}: duplicate auto-hide execution marker")
-
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
     rel = "chrome/browser/ui/views/bookmarks/bookmark_context_menu.h"
