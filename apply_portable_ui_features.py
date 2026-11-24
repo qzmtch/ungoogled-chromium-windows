@@ -1084,7 +1084,23 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
         source = source[:brace] + code + source[brace:]
 
     execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
-    if execute_marker not in source:
+        execute_marker = "PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE"
+    execute_signature = "void BookmarkContextMenuController::ExecuteCommand("
+    execute_start = source.find(execute_signature)
+    if execute_start < 0:
+        raise RuntimeError(f"{rel}: ExecuteCommand method not found")
+
+    execute_end_signature = (
+        "bool BookmarkContextMenuController::IsItemForCommandIdDynamic("
+    )
+    execute_end = source.find(
+        execute_end_signature, execute_start + len(execute_signature)
+    )
+    if execute_end < 0:
+        raise RuntimeError(f"{rel}: end of ExecuteCommand method not found")
+
+    execute_body = source[execute_start:execute_end]
+    if execute_marker not in execute_body:
         anchor = "    case IDC_BOOKMARK_BAR_ALWAYS_SHOW:\n"
         addition = '''    // PORTABLE_BOOKMARK_BAR_AUTOHIDE_EXECUTE
     case IDC_BOOKMARK_BAR_AUTO_HIDE: {
@@ -1099,7 +1115,17 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
       break;
     }
 '''
-        source = replace_once_or_present(source, anchor, addition + anchor, rel)
+        count = execute_body.count(anchor)
+        if count != 1:
+            raise RuntimeError(
+                f"{rel}: expected exactly one ALWAYS_SHOW case inside ExecuteCommand, "
+                f"found {count}"
+            )
+        execute_body = execute_body.replace(anchor, addition + anchor, 1)
+        source = source[:execute_start] + execute_body + source[execute_end:]
+    elif execute_body.count(execute_marker) != 1:
+        raise RuntimeError(f"{rel}: duplicate auto-hide execution marker")
+
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
     rel = "chrome/browser/ui/views/bookmarks/bookmark_context_menu.h"
