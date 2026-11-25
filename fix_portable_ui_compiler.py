@@ -99,6 +99,20 @@ def fix_bookmark_icons(root: Path) -> None:
         for item in custom_requirements:
             if item not in source:
                 raise RuntimeError(f"{relative}: custom JS bookmark icon is incomplete: {item}")
+
+        # Chromium 141's gfx::VectorIconRep contains one raw_span<const
+        # PathElement> member. A pointer-plus-size aggregate initializer
+        # compiles on older Chromium branches but is invalid here.
+        rep_pattern = re.compile(
+            r"(?s)static\s+const\s+gfx::VectorIconRep\s+"
+            r"kPortableJavascriptBookmarkReps\[\]\s*=\s*"
+            r"\{\s*\{\s*kPortableJavascriptBookmarkPath\s*\}\s*,?\s*\};"
+        )
+        if not rep_pattern.search(source):
+            raise RuntimeError(
+                f"{relative}: JS bookmark VectorIconRep must use the Chromium 141 "
+                "single-field raw_span initializer {kPortableJavascriptBookmarkPath}"
+            )
     elif legacy_icon not in source:
         raise RuntimeError(
             f"{relative}: neither the custom JS lettermark ({custom_icon}) nor the legacy "
