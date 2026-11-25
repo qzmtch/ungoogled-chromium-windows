@@ -800,9 +800,7 @@ def apply_bookmark_scheme_colors(root: Path) -> None:
         gfx::CUBIC_TO, 14.2f, 21.5f, 12.0f, 20.5f, 10.8f, 18.7f,
     };
     static const gfx::VectorIconRep kPortableJavascriptBookmarkReps[] = {
-        {kPortableJavascriptBookmarkPath,
-         sizeof(kPortableJavascriptBookmarkPath) /
-             sizeof(kPortableJavascriptBookmarkPath[0])},
+        {kPortableJavascriptBookmarkPath},
     };
     static constexpr gfx::VectorIcon kPortableJavascriptBookmarkIcon(
         kPortableJavascriptBookmarkReps, 1, "portable_javascript_bookmark");
@@ -853,6 +851,25 @@ def apply_bookmark_scheme_colors(root: Path) -> None:
     elif "kPortableJavascriptBookmarkIcon" in source:
         if "vector_icons::kDatabaseIcon" not in source:
             raise RuntimeError(f"{rel}: data: bookmark icon was lost")
+        # Chromium 141 VectorIconRep stores one raw_span field, not a
+        # pointer/length pair. Upgrade source trees touched by the old helper.
+        broken_rep = """static const gfx::VectorIconRep kPortableJavascriptBookmarkReps[] = {
+        {kPortableJavascriptBookmarkPath,
+         sizeof(kPortableJavascriptBookmarkPath) /
+             sizeof(kPortableJavascriptBookmarkPath[0])},
+    };"""
+        fixed_rep = """static const gfx::VectorIconRep kPortableJavascriptBookmarkReps[] = {
+        {kPortableJavascriptBookmarkPath},
+    };"""
+        if broken_rep in source:
+            source = replace_once_or_present(
+                source, broken_rep, fixed_rep,
+                f"{rel}: upgrade VectorIconRep to Chromium 141 raw_span layout",
+            )
+        if fixed_rep not in source:
+            raise RuntimeError(
+                f"{rel}: JS bookmark VectorIconRep must initialize its single raw_span path field"
+            )
     else:
         source = replace_once_or_present(
             source, old_block, new_block, f"{rel}: upgrade old JavaScript bookmark icon"
