@@ -52,7 +52,6 @@ async function uploadWithRetry(artifact, name, files, rootDirectory, compression
       } catch {
         // The artifact normally does not exist on the first attempt.
       }
-
       await artifact.uploadArtifact(name, files, rootDirectory, {
         retentionDays: 1,
         compressionLevel,
@@ -78,7 +77,6 @@ async function restoreIntermediateSource(artifact, artifactName) {
   if (!info || !info.artifact || !info.artifact.id) {
     throw new Error(`Intermediate artifact "${artifactName}" was not found in this workflow run.`);
   }
-
   await fs.mkdir(BUILD, { recursive: true });
   await fs.rm(DOWNLOADED_ARCHIVE, { force: true });
   await artifact.downloadArtifact(info.artifact.id, { path: BUILD });
@@ -86,7 +84,6 @@ async function restoreIntermediateSource(artifact, artifactName) {
   if (!(await exists(DOWNLOADED_ARCHIVE))) {
     throw new Error(`Downloaded intermediate archive not found: ${DOWNLOADED_ARCHIVE}`);
   }
-
   // The archive contains relative entries such as src/BUILD.gn.
   await exec.exec('7z', ['x', DOWNLOADED_ARCHIVE, `-o${BUILD}`, '-y'], { cwd: ROOT });
   await fs.rm(DOWNLOADED_ARCHIVE, { force: true });
@@ -120,9 +117,7 @@ async function createIntermediateArtifact(artifact, artifactName) {
       'Refusing to upload an incomplete intermediate artifact. Missing:\n' + missing.join('\n')
     );
   }
-
   await fs.rm(STAGE_ARCHIVE, { force: true });
-
   // Store relative paths so extracting into build recreates build/src.
   // 7-Zip may return code 1 for missing/broken non-Windows source paths while
   // still producing a usable ZIP. Accept only code 0 or 1, and test the ZIP
@@ -135,7 +130,6 @@ async function createIntermediateArtifact(artifact, artifactName) {
       ignoreReturnCode: true,
     }
   );
-
   if (archiveExitCode !== 0 && archiveExitCode !== 1) {
     throw new Error(`7-Zip failed to create the intermediate archive (exit code ${archiveExitCode}).`);
   }
@@ -144,14 +138,12 @@ async function createIntermediateArtifact(artifact, artifactName) {
   if (!archiveInfo || !archiveInfo.size) {
     throw new Error('The intermediate source archive is missing or empty.');
   }
-
   if (archiveExitCode === 1) {
     core.warning(
       '7-Zip returned warning code 1 while creating the intermediate ZIP. ' +
       'Testing the archive before upload; review the missing-path warnings above.'
     );
   }
-
   const testExitCode = await exec.exec('7z', ['t', STAGE_ARCHIVE], {
     cwd: BUILD,
     ignoreReturnCode: true,
@@ -167,12 +159,36 @@ async function createIntermediateArtifact(artifact, artifactName) {
   core.setOutput('finished', 'false');
 }
 
+async function moveChromeProxyToPortableRoot() {
+  const proxyAtRoot = path.join(PORTABLE_DIR, 'chrome_proxy.exe');
+  if (await exists(proxyAtRoot)) {
+    return;
+  }
+
+  const entries = await fs.readdir(PORTABLE_DIR, { withFileTypes: true });
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(PORTABLE_DIR, entry.name, 'chrome_proxy.exe');
+    if (await exists(candidate)) candidates.push(candidate);
+  }
+
+  if (candidates.length !== 1) {
+    throw new Error(
+      `Expected exactly one versioned chrome_proxy.exe to move beside chrome.exe, found ${candidates.length}. ` +
+      'Check chrome/tools/build/win/FILES.cfg and the package.py contents.'
+    );
+  }
+
+  await fs.rename(candidates[0], proxyAtRoot);
+  console.log(`Moved chrome_proxy.exe to portable root: ${proxyAtRoot}`);
+}
+
 async function createPortableArtifact(artifact, finalArtifactName, arch) {
   // build.py --ci runs package.py itself after the full compile succeeds.
   const packagePattern = path.join(BUILD, `ungoogled-chromium_*_windows_${arch}.zip`);
   const packageGlob = await glob.create(packagePattern, { matchDirectories: false });
   const packageZips = await packageGlob.glob();
-
   if (packageZips.length === 0) {
     throw new Error(
       `build.py returned success, but the browser package ZIP was not found: ${packagePattern}. ` +
@@ -187,14 +203,11 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
   await fs.mkdir(PORTABLE_DIR, { recursive: true });
   await exec.exec('7z', ['x', packageZips[0], `-o${PORTABLE_DIR}`, '-y'], { cwd: BUILD });
 
-  // package.py's create_archive() stores the payload under a wrapper folder
-  // named after the ZIP. Flatten that wrapper so chrome.exe and portable.flag
-  // live directly under chromePortable/.
+  // Flatten legacy package archives that contain an extra wrapper directory.
   const packageRootName = path.basename(packageZips[0], path.extname(packageZips[0]));
   const extractedPackageRoot = path.join(PORTABLE_DIR, packageRootName);
   const chromeExeInPackageRoot = path.join(extractedPackageRoot, 'chrome.exe');
   const chromeExeAtRoot = path.join(PORTABLE_DIR, 'chrome.exe');
-
   if (!(await exists(chromeExeAtRoot)) && await exists(chromeExeInPackageRoot)) {
     console.log(`Flattening package archive root: ${extractedPackageRoot}`);
     const rootEntries = await fs.readdir(extractedPackageRoot);
@@ -202,9 +215,7 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
       const sourcePath = path.join(extractedPackageRoot, entryName);
       const destinationPath = path.join(PORTABLE_DIR, entryName);
       if (await exists(destinationPath)) {
-        throw new Error(
-          `Cannot flatten browser package: destination already exists: ${destinationPath}`
-        );
+        throw new Error(`Cannot flatten browser package: destination already exists: ${destinationPath}`);
       }
       await fs.rename(sourcePath, destinationPath);
     }
@@ -219,9 +230,14 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
     );
   }
 
-  // Chromium itself reads this marker to select UserData next to chrome.exe.
-  // No BAT launcher, extra DLL, or command-line switch is added here.
-  await fs.writeFile(path.join(PORTABLE_DIR, 'portable.flag'), '');
+  // Portable source layout selects UserData beside this root chrome.exe directly;
+  // no marker file is needed in the final package.
+  await fs.rm(path.join(PORTABLE_DIR, 'portable.flag'), { force: true });
+
+  // chrome_proxy.exe must share a directory with chrome.exe because the proxy
+  // resolves the browser executable relative to its own directory. Keep
+  // chrome_pwa_launcher.exe and the remaining versioned payload in the version folder.
+  await moveChromeProxyToPortableRoot();
 
   let hasChromeDll = await exists(path.join(PORTABLE_DIR, 'chrome.dll'));
   if (!hasChromeDll) {
@@ -249,16 +265,16 @@ async function createPortableArtifact(artifact, finalArtifactName, arch) {
 }
 
 async function run() {
-  console.log('[PORTABLE-LAYOUT-FIX-v2] Updated .github/actions/stage/index.js loaded.');
+  console.log('[PORTABLE-LAYOUT-FIX-v3] chrome.exe and chrome_proxy.exe are staged at portable root.');
   console.log('[RESUMABLE-NINJA-CHECKPOINT-v1] Ninja failure recovery handler loaded.');
   console.log('[STAGE-INPUT-FIX-v1] Missing finished input safely defaults to false.');
   console.log('[PORTABLE-PATCH-FAIL-FAST-v1] Owned-source compiler errors stop the stage chain.');
+
   const finishedInput = core.getInput('finished').trim();
   const finished = finishedInput === '' ? false : core.getBooleanInput('finished');
   const fromArtifact = core.getBooleanInput('from_artifact', { required: true });
   const x86 = core.getBooleanInput('x86', { required: false });
   const arm = core.getBooleanInput('arm', { required: false });
-
   const intermediateArtifactName = x86
     ? 'build-artifact-x86'
     : (arm ? 'build-artifact-arm' : 'build-artifact');
@@ -268,7 +284,6 @@ async function run() {
   const arch = x86 ? 'x86' : (arm ? 'arm64' : 'x64');
 
   console.log(`finished=${finished}, fromArtifact=${fromArtifact}, arch=${arch}`);
-
   if (finished) {
     core.setOutput('finished', 'true');
     return;
@@ -282,7 +297,6 @@ async function run() {
   const args = ['build.py', '--ci'];
   if (x86) args.push('--x86');
   if (arm) args.push('--arm');
-
   await exec.exec('python', ['-m', 'pip', 'install', 'httplib2==0.22.0'], {
     cwd: ROOT,
     ignoreReturnCode: true,
@@ -297,7 +311,6 @@ async function run() {
   if (!ownership.seriesPath) {
     core.warning('Could not locate the Windows patch series file; fail-fast still tracks the portable source post-processors.');
   }
-
   let recentBuildOutput = '';
   const rememberBuildOutput = (chunk) => {
     recentBuildOutput = (recentBuildOutput + chunk.toString()).slice(-200000);
@@ -312,7 +325,6 @@ async function run() {
     },
   });
   console.log(`build.py exit code: ${exitCode}`);
-
   if (exitCode === 0) {
     await createPortableArtifact(artifact, finalArtifactName, arch);
     return;
@@ -322,7 +334,6 @@ async function run() {
   const ninjaSubcommandFailure =
     /ninja:\s*build stopped:\s*subcommand failed/i.test(recentBuildOutput) &&
     /RuntimeError:\s*Build failed!/i.test(recentBuildOutput);
-
   if (!expectedCiTimeout && !ninjaSubcommandFailure) {
     throw new Error(
       `build.py failed with exit code ${exitCode}. The log does not identify this as ` +
@@ -347,7 +358,6 @@ async function run() {
         'Fix these source errors and restart the workflow from build-1.'
       );
     }
-
     core.warning(
       'Ninja failed, but the compiler diagnostics do not point to files changed by this repository. ' +
       'Keeping the existing incremental checkpoint/retry behavior for upstream or unrelated failures.'
