@@ -432,7 +432,8 @@ jobs:
         run: |
           set -euo pipefail
           test -f release-staging/chromePortable/chrome.exe
-          test -f release-staging/chromePortable/portable.flag
+          test -f release-staging/chromePortable/chrome_proxy.exe
+          test ! -e release-staging/chromePortable/portable.flag
           cd release-staging
           # Package only the compiled browser folder, never the multi-gigabyte build/src tree.
           zip -qr -9 ../chromePortable.zip chromePortable
@@ -470,7 +471,8 @@ jobs:
             ### ✨ Features
             - Portable profile stored in `chromePortable/UserData`
             - Works when launched directly, through file associations, and after Chromium restarts
-            - No launcher BAT and no external `version.dll`
+            - No `portable.flag`, launcher BAT, or external `version.dll`
+            - `chrome_proxy.exe` is placed beside the root `chrome.exe` for PWA shortcuts
             - No command-line switches that disable encryption
             If the archive exceeds GitHub's 2 GiB per-file limit, it is published as numbered
             `chromePortable.zip.part-XX` files. Download all parts into one directory and
