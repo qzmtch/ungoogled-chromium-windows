@@ -32,79 +32,113 @@ def replace_once_or_present(text: str, old: str, new: str, label: str) -> str:
 
 
 def apply_menu_density(root: Path) -> None:
+    rel_h = "ui/views/controls/menu/menu_config.h"
+    path_h, header = read_text(root, rel_h)
+    setter_decl = "  static void SetPortableCompactMode(bool enabled);\n"
+    if setter_decl.strip() not in header:
+        anchor = "  static const MenuConfig& instance();\n"
+        header = replace_once_or_present(header, anchor, anchor + setter_decl, rel_h)
+    write_if_changed(path_h, path_h.read_text(encoding="utf-8"), header)
+
     rel = "ui/views/controls/menu/menu_config.cc"
     path, source = read_text(root, rel)
-    if "// PORTABLE_UI_MENU_DENSITY" not in source:
-        old = """  item_vertical_margin = 6;
-  item_horizontal_border_padding = 12;
-  arrow_size = 16;
-  separator_height = 17;
-  separator_spacing_height = 4;
-"""
-        new = """  // PORTABLE_UI_MENU_DENSITY: compact menus without shrinking their fonts.
-  item_vertical_margin = 3;
-  item_horizontal_border_padding = 0;
-  arrow_size = 16;
-  separator_height = 13;
-  separator_spacing_height = 2;
-"""
-        source = replace_once_or_present(source, old, new, rel)
-    else:
-        # Earlier UI builds already had the marker but retained a 12px side gutter.
-        source, count = re.subn(
-            r"(?m)^(\s*item_horizontal_border_padding\s*=\s*)12(;)",
-            r"\g<1>0\2",
-            source,
-        )
-        if count > 1:
-            raise RuntimeError(f"{rel}: found multiple horizontal border padding settings")
-        if count == 0 and not re.search(
-            r"(?m)^\s*item_horizontal_border_padding\s*=\s*0;", source
-        ):
-            raise RuntimeError(f"{rel}: could not verify horizontal border padding setting")
-    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+    marker = "PORTABLE_UI_MENU_DENSITY_RUNTIME"
+    if marker not in source:
+        namespace_anchor = "namespace views {\n"
+        helper = '''namespace views {
+namespace {
+// PORTABLE_UI_MENU_DENSITY_RUNTIME
+bool g_portable_compact_menu_mode = false;
 
+void ApplyPortableCompactMenuValues(MenuConfig* config) {
+  config->item_vertical_margin = g_portable_compact_menu_mode ? 3 : 6;
+  config->item_horizontal_border_padding = g_portable_compact_menu_mode ? 0 : 12;
+  config->separator_height = g_portable_compact_menu_mode ? 13 : 17;
+  config->separator_spacing_height = g_portable_compact_menu_mode ? 2 : 4;
+  config->arrow_size = 16;
+}
+}  // namespace
+'''
+        source = replace_once_or_present(source, namespace_anchor, helper, rel)
+
+        ctor_anchor = "MenuConfig::MenuConfig() {\n  InitCommon();\n  InitPlatform();\n}\n"
+        ctor_new = "MenuConfig::MenuConfig() {\n  InitCommon();\n  InitPlatform();\n  ApplyPortableCompactMenuValues(this);\n}\n"
+        source = replace_once_or_present(source, ctor_anchor, ctor_new, rel)
+
+        instance_anchor = '''const MenuConfig& MenuConfig::instance() {
+  static base::NoDestructor<MenuConfig> instance;
+  return *instance;
+}
+'''
+        setter_impl = instance_anchor + '''
+void MenuConfig::SetPortableCompactMode(bool enabled) {
+  g_portable_compact_menu_mode = enabled;
+  auto& config = const_cast<MenuConfig&>(instance());
+  ApplyPortableCompactMenuValues(&config);
+}
+'''
+        source = replace_once_or_present(source, instance_anchor, setter_impl, rel)
+    else:
+        for required in (
+            "ApplyPortableCompactMenuValues(this);",
+            "void MenuConfig::SetPortableCompactMode(bool enabled)",
+            "g_portable_compact_menu_mode ? 3 : 6",
+            "g_portable_compact_menu_mode ? 0 : 12",
+        ):
+            if required not in source:
+                raise RuntimeError(f"{rel}: compact-menu runtime implementation is incomplete: {required}")
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
 def apply_app_menu_density(root: Path) -> None:
     rel = "chrome/browser/ui/views/toolbar/app_menu.cc"
     path, source = read_text(root, rel)
-    if "// PORTABLE_UI_APP_MENU_DENSITY" in source:
-        return
+    marker = "PORTABLE_UI_APP_MENU_DENSITY_RUNTIME"
+    if marker not in source:
+        include = '#include "chrome/browser/ui/layout_constants.h"\n'
+        if include not in source:
+            anchor = '#include "chrome/browser/ui/browser_window.h"\n'
+            source = replace_once_or_present(source, anchor, anchor + include, f"{rel}: layout constants include")
 
-    profile_old = """        add_menu_row_background(ChromeLayoutProvider::Get()->GetDistanceMetric(
+        profile_old = '''        add_menu_row_background(ChromeLayoutProvider::Get()->GetDistanceMetric(
                                     DISTANCE_CONTENT_LIST_VERTICAL_MULTI),
                                 ui::kColorAppMenuProfileRowBackground);
-"""
-    profile_new = """        // PORTABLE_UI_APP_MENU_DENSITY
-        add_menu_row_background(6, ui::kColorAppMenuProfileRowBackground);
-"""
-    source = replace_once_or_present(
-        source, profile_old, profile_new, f"{rel}: profile row margin"
-    )
+'''
+        profile_new = '''        // PORTABLE_UI_APP_MENU_DENSITY_RUNTIME
+        add_menu_row_background(
+            IsPortableCompactUiEnabled() ? 6 :
+                ChromeLayoutProvider::Get()->GetDistanceMetric(
+                    DISTANCE_CONTENT_LIST_VERTICAL_MULTI),
+            ui::kColorAppMenuProfileRowBackground);
+'''
+        source = replace_once_or_present(source, profile_old, profile_new, f"{rel}: profile row margin")
 
-    upgrade_old = "        add_menu_row_background(12, ui::kColorAppMenuUpgradeRowBackground);"
-    upgrade_new = "        add_menu_row_background(6, ui::kColorAppMenuUpgradeRowBackground);"
-    if upgrade_new not in source:
+        upgrade_old = "        add_menu_row_background(12, ui::kColorAppMenuUpgradeRowBackground);"
+        upgrade_new = "        add_menu_row_background(IsPortableCompactUiEnabled() ? 6 : 12, ui::kColorAppMenuUpgradeRowBackground);"
         count = source.count(upgrade_old)
         if count != 2:
-            raise RuntimeError(
-                f"{rel}: expected two upgrade row margin anchors, found {count}"
-            )
+            raise RuntimeError(f"{rel}: expected two upgrade row margin anchors, found {count}")
         source = source.replace(upgrade_old, upgrade_new)
 
-    default_old = """          add_menu_row_background(
+        default_old = '''          add_menu_row_background(
               views::LayoutProvider::Get()->GetDistanceMetric(
                   views::DISTANCE_CONTROL_VERTICAL_TEXT_PADDING),
               ui::kColorAppMenuUpgradeRowBackground);
-"""
-    default_new = """          add_menu_row_background(
-              6, ui::kColorAppMenuUpgradeRowBackground);
-"""
-    source = replace_once_or_present(
-        source, default_old, default_new, f"{rel}: set-default row margin"
-    )
+'''
+        default_new = '''          add_menu_row_background(
+              IsPortableCompactUiEnabled() ? 6 :
+                  views::LayoutProvider::Get()->GetDistanceMetric(
+                      views::DISTANCE_CONTROL_VERTICAL_TEXT_PADDING),
+              ui::kColorAppMenuUpgradeRowBackground);
+'''
+        source = replace_once_or_present(source, default_old, default_new, f"{rel}: default row margin")
+    else:
+        for required in (
+            "PORTABLE_UI_APP_MENU_DENSITY_RUNTIME",
+            "IsPortableCompactUiEnabled() ? 6 :",
+        ):
+            if required not in source:
+                raise RuntimeError(f"{rel}: compact app-menu setting is incomplete: {required}")
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
-
 
 def apply_tab_discard(root: Path) -> None:
     # Both commands are always tied to the tab whose context menu was opened.
@@ -638,19 +672,9 @@ def apply_menu_roundness(root: Path) -> None:
     path, source = read_text(root, rel)
     marker = "PORTABLE_UI_MENU_ROUNDNESS"
     if marker not in source:
-        old = """MenuConfig::MenuConfig() {
-  InitCommon();
-  InitPlatform();
-}"""
-        new = """MenuConfig::MenuConfig() {
-  InitCommon();
-  InitPlatform();
-  // PORTABLE_UI_MENU_ROUNDNESS: slightly reduce outer menu corner radii.
-  corner_radius = 6;
-  auxiliary_corner_radius = 5;
-  touchable_corner_radius = 6;
-}"""
-        source = replace_once_or_present(source, old, new, rel)
+        anchor = "  InitPlatform();\n  ApplyPortableCompactMenuValues(this);\n"
+        addition = anchor + "  // PORTABLE_UI_MENU_ROUNDNESS: slightly reduce outer menu corner radii.\n  corner_radius = 6;\n  auxiliary_corner_radius = 5;\n  touchable_corner_radius = 6;\n"
+        source = replace_once_or_present(source, anchor, addition, rel)
     else:
         for required in (
             "corner_radius = 6;",
@@ -661,103 +685,134 @@ def apply_menu_roundness(root: Path) -> None:
                 raise RuntimeError(f"{rel}: incomplete roundness override: {required}")
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
-
 def apply_compact_toolbar(root: Path) -> None:
+    rel_h = "chrome/browser/ui/layout_constants.h"
+    path_h, header = read_text(root, rel_h)
+    declarations = "bool IsPortableCompactUiEnabled();\nvoid SetPortableCompactUiEnabled(bool enabled);\n\n"
+    if "bool IsPortableCompactUiEnabled();" not in header:
+        anchor = '#include "ui/gfx/geometry/size.h"\n'
+        header = replace_once_or_present(header, anchor, anchor + declarations, rel_h)
+    write_if_changed(path_h, path_h.read_text(encoding="utf-8"), header)
+
     rel = "chrome/browser/ui/layout_constants.cc"
     path, source = read_text(root, rel)
-    marker = "PORTABLE_UI_COMPACT_TOOLBAR"
-    replacements = [
-        (
-            "const int bookmark_bar_attached_vertical_margin = 6;",
-            "const int bookmark_bar_attached_vertical_margin = 2;",
-            "bookmark bar vertical margin",
-        ),
-        (
-            "case BOOKMARK_BAR_BUTTON_HEIGHT:\n      return touch_ui ? 36 : 28;",
-            "case BOOKMARK_BAR_BUTTON_HEIGHT:\n      return touch_ui ? 36 : 26;",
-            "bookmark button height",
-        ),
-        (
-            "case BOOKMARK_BAR_BUTTON_IMAGE_LABEL_PADDING:\n      return 6;",
-            "case BOOKMARK_BAR_BUTTON_IMAGE_LABEL_PADDING:\n      return 5;",
-            "bookmark icon-label gap",
-        ),
-        (
-            "case LOCATION_BAR_ELEMENT_PADDING:\n      return touch_ui ? 3 : 2;",
-            "case LOCATION_BAR_ELEMENT_PADDING:\n      return touch_ui ? 3 : 1;",
-            "location-bar element padding",
-        ),
-        (
-            "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 34;",
-            "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 30;",
-            "location-bar height",
-        ),
-        (
-            "case TOOLBAR_BUTTON_HEIGHT:\n      return touch_ui ? 48 : 34;",
-            "case TOOLBAR_BUTTON_HEIGHT:\n      return touch_ui ? 48 : 32;",
-            "toolbar button height",
-        ),
-        (
-            "case TOOLBAR_ELEMENT_PADDING:\n      return touch_ui ? 0 : 4;",
-            "case TOOLBAR_ELEMENT_PADDING:\n      return touch_ui ? 0 : 3;",
-            "toolbar element padding",
-        ),
-        (
-            "case TOOLBAR_ICON_DEFAULT_MARGIN:\n      return touch_ui ? 0 : 2;",
-            "case TOOLBAR_ICON_DEFAULT_MARGIN:\n      return touch_ui ? 0 : 1;",
-            "toolbar icon margin",
-        ),
-        (
-            "case TOOLBAR_STANDARD_SPACING:\n      return touch_ui ? 12 : 9;",
-            "case TOOLBAR_STANDARD_SPACING:\n      return touch_ui ? 12 : 8;",
-            "toolbar horizontal spacing",
-        ),
-        (
-            "case TOOLBAR_BUTTON:\n      return gfx::Insets(touch_ui ? 12 : 7);",
-            "case TOOLBAR_BUTTON:\n      return gfx::Insets(touch_ui ? 12 : 6);",
-            "toolbar button insets",
-        ),
-        (
-            "case TOOLBAR_INTERIOR_MARGIN:\n      return touch_ui ? gfx::Insets::VH(4, 0) : gfx::Insets::VH(6, 5);",
-            "case TOOLBAR_INTERIOR_MARGIN:\n      return touch_ui ? gfx::Insets::VH(4, 0) : gfx::Insets::VH(5, 4);",
-            "toolbar interior margin",
-        ),
-    ]
+    marker = "PORTABLE_UI_COMPACT_LAYOUT_V2"
     if marker not in source:
-        for old, new, label in replacements:
-            source = replace_once_or_present(source, old, new, f"{rel}: {label}")
-        anchor = "int GetLayoutConstant(LayoutConstant constant) {\n"
-        source = replace_once_or_present(
-            source,
-            anchor,
-            anchor + "  // PORTABLE_UI_COMPACT_TOOLBAR: modest desktop-only tightening.\n",
-            rel,
-        )
-    else:
-        # Upgrade checkpoints produced by earlier versions of this helper.
-        legacy_upgrades = [
+        state_anchor = "#endif  // BUILDFLAG(IS_CHROMEOS)\n"
+        state_code = '''#endif  // BUILDFLAG(IS_CHROMEOS)
+namespace {
+// PORTABLE_UI_COMPACT_LAYOUT_V2
+bool g_portable_compact_ui_enabled = false;
+}  // namespace
+
+bool IsPortableCompactUiEnabled() {
+  return g_portable_compact_ui_enabled;
+}
+
+void SetPortableCompactUiEnabled(bool enabled) {
+  g_portable_compact_ui_enabled = enabled;
+}
+'''
+        source = replace_once_or_present(source, state_anchor, state_code, rel)
+
+        replacements = [
             (
-                "const int bookmark_bar_attached_vertical_margin = 5;",
-                "const int bookmark_bar_attached_vertical_margin = 2;",
+                "const int bookmark_bar_attached_vertical_margin = 6;",
+                "const int bookmark_bar_attached_vertical_margin =\n          IsPortableCompactUiEnabled() ? 2 : 6;",
                 "bookmark bar vertical margin",
             ),
             (
-                "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 33;",
-                "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 30;",
-                "location-bar height",
+                "case BOOKMARK_BAR_BUTTON_HEIGHT:\n      return touch_ui ? 36 : 28;",
+                "case BOOKMARK_BAR_BUTTON_HEIGHT:\n      return touch_ui ? 36 :\n          (IsPortableCompactUiEnabled() ? 26 : 28);",
+                "bookmark button height",
+            ),
+            (
+                "case BOOKMARK_BAR_BUTTON_IMAGE_LABEL_PADDING:\n      return 6;",
+                "case BOOKMARK_BAR_BUTTON_IMAGE_LABEL_PADDING:\n      return IsPortableCompactUiEnabled() ? 5 : 6;",
+                "bookmark icon-label padding",
+            ),
+            (
+                "case LOCATION_BAR_ELEMENT_PADDING:\n      return touch_ui ? 3 : 2;",
+                "case LOCATION_BAR_ELEMENT_PADDING:\n      return touch_ui ? 3 :\n          (IsPortableCompactUiEnabled() ? 1 : 2);",
+                "location bar element padding",
+            ),
+            (
+                "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 : 34;",
+                "case LOCATION_BAR_HEIGHT:\n      return touch_ui ? 36 :\n          (IsPortableCompactUiEnabled() ? 28 : 34);",
+                "location bar height",
+            ),
+            (
+                "case TOOLBAR_BUTTON_HEIGHT:\n      return touch_ui ? 48 : 34;",
+                "case TOOLBAR_BUTTON_HEIGHT:\n      return touch_ui ? 48 :\n          (IsPortableCompactUiEnabled() ? 32 : 34);",
+                "toolbar button height",
+            ),
+            (
+                "case TOOLBAR_ELEMENT_PADDING:\n      return touch_ui ? 0 : 4;",
+                "case TOOLBAR_ELEMENT_PADDING:\n      return touch_ui ? 0 :\n          (IsPortableCompactUiEnabled() ? 3 : 4);",
+                "toolbar element padding",
+            ),
+            (
+                "case TOOLBAR_ICON_DEFAULT_MARGIN:\n      return touch_ui ? 0 : 2;",
+                "case TOOLBAR_ICON_DEFAULT_MARGIN:\n      return touch_ui ? 0 :\n          (IsPortableCompactUiEnabled() ? 1 : 2);",
+                "toolbar icon margin",
+            ),
+            (
+                "case TOOLBAR_STANDARD_SPACING:\n      return touch_ui ? 12 : 9;",
+                "case TOOLBAR_STANDARD_SPACING:\n      return touch_ui ? 12 :\n          (IsPortableCompactUiEnabled() ? 8 : 9);",
+                "toolbar standard spacing",
+            ),
+            (
+                "case TOOLBAR_BUTTON:\n      return gfx::Insets(touch_ui ? 12 : 7);",
+                "case TOOLBAR_BUTTON:\n      return gfx::Insets(touch_ui ? 12 :\n          (IsPortableCompactUiEnabled() ? 6 : 7));",
+                "toolbar button insets",
+            ),
+            (
+                "case TOOLBAR_INTERIOR_MARGIN:\n      return touch_ui ? gfx::Insets::VH(4, 0) : gfx::Insets::VH(6, 5);",
+                "case TOOLBAR_INTERIOR_MARGIN:\n      return touch_ui ? gfx::Insets::VH(4, 0) :\n          (IsPortableCompactUiEnabled() ? gfx::Insets::VH(5, 4)\n                                        : gfx::Insets::VH(6, 5));",
+                "toolbar interior margin",
             ),
         ]
-        for old_value, new_value, label in legacy_upgrades:
-            source = replace_once_or_present(
-                source, old_value, new_value, f"{rel}: upgrade {label}"
-            )
-        for _old, desired, label in replacements:
-            if desired not in source:
-                raise RuntimeError(
-                    f"{rel}: compact toolbar marker exists but {label} is missing"
-                )
-    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+        for old, new, label in replacements:
+            source = replace_once_or_present(source, old, new, f"{rel}: {label}")
 
+        # A compact desktop tab is 5 DIP shorter, and the strip's vertical
+        # padding is reduced from 6 to 3 DIP. Touch UI remains unchanged.
+        tab_height = re.compile(r"(?ms)^(\s*case\s+TAB_HEIGHT:\s*\{?\s*.*?^\s*return\s+)([^;]+)(;)")
+        match = tab_height.search(source)
+        if not match:
+            raise RuntimeError(f"{rel}: TAB_HEIGHT case was not found")
+        expr = match.group(2).strip()
+        new_expr = (
+            "(!touch_ui && IsPortableCompactUiEnabled()) ? (" + expr +
+            " - 5) : (" + expr + ")"
+        )
+        source = source[:match.start(2)] + new_expr + source[match.end(2):]
+
+        strip_padding = re.compile(r"(?m)^(\s*case\s+TAB_STRIP_PADDING:\s*\n\s*return\s+)([^;]+)(;)")
+        match = strip_padding.search(source)
+        if not match:
+            raise RuntimeError(f"{rel}: TAB_STRIP_PADDING case was not found")
+        strip_expr = match.group(2).strip()
+        if strip_expr not in ("6", "6 /*...*/"):
+            # Keep source-specific comments/expressions intact while applying
+            # the compact override only to desktop UI.
+            compact_strip_expr = "3"
+        else:
+            compact_strip_expr = "3"
+        new_strip_expr = (
+            "(!touch_ui && IsPortableCompactUiEnabled()) ? " + compact_strip_expr +
+            " : (" + strip_expr + ")"
+        )
+        source = source[:match.start(2)] + new_strip_expr + source[match.end(2):]
+    else:
+        for required in (
+            "bool IsPortableCompactUiEnabled()",
+            "IsPortableCompactUiEnabled() ? 28 : 34",
+            "(!touch_ui && IsPortableCompactUiEnabled())",
+        ):
+            if required not in source:
+                raise RuntimeError(f"{rel}: compact layout override is incomplete: {required}")
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
 def apply_bookmark_scheme_colors(root: Path) -> None:
     rel = "chrome/browser/ui/views/bookmarks/bookmark_bar_view.cc"
@@ -1374,6 +1429,159 @@ def apply_bookmark_bar_autohide(root: Path) -> None:
         raise RuntimeError(f"{rel}: partial bookmark-bar auto-hide state patch")
     write_if_changed(path, path.read_text(encoding="utf-8"), source)
 
+def apply_portable_compact_ui_settings(root: Path) -> None:
+    # Profile preference; deliberately not syncable.
+    rel = "chrome/common/pref_names.h"
+    path, source = read_text(root, rel)
+    if "kPortableCompactUiEnabled" not in source:
+        anchor = 'inline constexpr char kShowHomeButton[] = "browser.show_home_button";\n'
+        addition = anchor + (
+            "// Whether the compact portable-browser layout is enabled.\n"
+            'inline constexpr char kPortableCompactUiEnabled[] =\n'
+            '    "browser.portable_compact_ui_enabled";\n'
+        )
+        source = replace_once_or_present(source, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/ui/browser_ui_prefs.cc"
+    path, source = read_text(root, rel)
+    marker = "PORTABLE_COMPACT_UI_PREF_REGISTRATION"
+    if marker not in source:
+        anchor = "  registry->RegisterBooleanPref(prefs::kShowHomeButton, false,\n                                pref_registration_flags);\n"
+        addition = anchor + (
+            "  // PORTABLE_COMPACT_UI_PREF_REGISTRATION: local profile preference, not synced.\n"
+            "  registry->RegisterBooleanPref(prefs::kPortableCompactUiEnabled, false);\n"
+        )
+        source = replace_once_or_present(source, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/extensions/api/settings_private/prefs_util.cc"
+    path, source = read_text(root, rel)
+    allow = "  (*s_allowlist)[::prefs::kPortableCompactUiEnabled] =\n      settings_api::PrefType::kBoolean;\n"
+    if "kPortableCompactUiEnabled" not in source:
+        anchor = "  (*s_allowlist)[::prefs::kShowHomeButton] = settings_api::PrefType::kBoolean;\n"
+        source = replace_once_or_present(source, anchor, anchor + allow, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/resources/settings/appearance_page/appearance_page.html"
+    path, source = read_text(root, rel)
+    marker = "PORTABLE_COMPACT_UI_SETTINGS_TOGGLE"
+    if marker not in source:
+        anchor = '''        <settings-toggle-button
+            hidden="[[!pageVisibility.bookmarksBar]]"
+            pref="{{prefs.bookmark_bar.show_on_all_tabs}}"
+            label="$i18n{showBookmarksBar}">
+        </settings-toggle-button>
+'''
+        addition = anchor + '''        <!-- PORTABLE_COMPACT_UI_SETTINGS_TOGGLE -->
+        <settings-toggle-button class="hr" id="portableCompactUi"
+            pref="{{prefs.browser.portable_compact_ui_enabled}}"
+            label="$i18n{portableCompactUi}">
+        </settings-toggle-button>
+'''
+        source = replace_once_or_present(source, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/app/settings_strings.grdp"
+    path, source = read_text(root, rel)
+    if "IDS_SETTINGS_PORTABLE_COMPACT_UI" not in source:
+        closing = "</grit-part>"
+        message = '''  <message name="IDS_SETTINGS_PORTABLE_COMPACT_UI" desc="Label for the compact interface setting in Appearance settings">
+    Компактный интерфейс
+  </message>
+'''
+        if source.count(closing) != 1:
+            raise RuntimeError(f"{rel}: expected one closing grit-part tag")
+        source = source.replace(closing, message + closing, 1)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    rel = "chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc"
+    path, source = read_text(root, rel)
+    entry = '      {"portableCompactUi", IDS_SETTINGS_PORTABLE_COMPACT_UI},\n'
+    if "portableCompactUi" not in source:
+        anchor = '      {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},\n'
+        source = replace_once_or_present(source, anchor, anchor + entry, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
+    # BrowserView applies the pref to layout constants and menu metrics at runtime.
+    rel = "chrome/browser/ui/views/frame/browser_view.h"
+    path, header = read_text(root, rel)
+    registrar_include = '#include "components/prefs/pref_change_registrar.h"\n'
+    if registrar_include not in header:
+        anchor = '#include "components/infobars/core/infobar_container.h"\n'
+        header = replace_once_or_present(header, anchor, registrar_include + anchor, rel)
+    methods_marker = "PORTABLE_COMPACT_UI_PREF_METHODS"
+    if methods_marker not in header:
+        anchor = " private:\n   // Do not friend BrowserViewLayout."
+        methods = ''' private:
+   // PORTABLE_COMPACT_UI_PREF_METHODS
+   void InitializePortableCompactUiPref();
+   void OnPortableCompactUiPrefChanged();
+   // Do not friend BrowserViewLayout.'''
+        header = replace_once_or_present(header, anchor, methods, rel)
+    state_marker = "PORTABLE_COMPACT_UI_PREF_STATE"
+    if state_marker not in header:
+        anchor = "  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_STATE\n"
+        addition = anchor + (
+            "  // PORTABLE_COMPACT_UI_PREF_STATE\n"
+            "  PrefChangeRegistrar portable_compact_ui_pref_change_registrar_;\n"
+            "  bool portable_compact_ui_pref_initialized_ = false;\n"
+        )
+        header = replace_once_or_present(header, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), header)
+
+    rel = "chrome/browser/ui/views/frame/browser_view.cc"
+    path, source = read_text(root, rel)
+    includes = (
+        '#include "chrome/common/pref_names.h"\n',
+        '#include "components/prefs/pref_service.h"\n',
+        '#include "ui/views/controls/menu/menu_config.h"\n',
+    )
+    for include in includes:
+        if include not in source:
+            anchor = '#include "chrome/browser/profiles/profile.h"\n'
+            source = replace_once_or_present(source, anchor, anchor + include, f"{rel}: include {include.strip()}")
+
+    methods_marker = "PORTABLE_COMPACT_UI_PREF_METHODS"
+    if methods_marker not in source:
+        method_code = '''// PORTABLE_COMPACT_UI_PREF_METHODS
+void BrowserView::InitializePortableCompactUiPref() {
+  if (portable_compact_ui_pref_initialized_ || !browser_) {
+    return;
+  }
+  portable_compact_ui_pref_initialized_ = true;
+  PrefService* prefs = browser_->GetProfile()->GetPrefs();
+  portable_compact_ui_pref_change_registrar_.Init(prefs);
+  portable_compact_ui_pref_change_registrar_.Add(
+      prefs::kPortableCompactUiEnabled,
+      base::BindRepeating(&BrowserView::OnPortableCompactUiPrefChanged,
+                          base::Unretained(this)));
+  OnPortableCompactUiPrefChanged();
+}
+
+void BrowserView::OnPortableCompactUiPrefChanged() {
+  if (!browser_) {
+    return;
+  }
+  const bool enabled = browser_->GetProfile()->GetPrefs()->GetBoolean(
+      prefs::kPortableCompactUiEnabled);
+  SetPortableCompactUiEnabled(enabled);
+  views::MenuConfig::SetPortableCompactMode(enabled);
+  PreferredSizeChanged();
+  InvalidateLayout();
+}
+
+'''
+        anchor = "void BrowserView::OnMouseEvent(ui::MouseEvent* event) {\n"
+        source = replace_once_or_present(source, anchor, method_code + anchor, rel)
+
+    init_marker = "PORTABLE_COMPACT_UI_PREF_INIT"
+    if init_marker not in source:
+        anchor = "void BrowserView::AddedToWidget() {\n  // PORTABLE_BOOKMARK_BAR_AUTOHIDE_REGISTER\n"
+        addition = anchor + "  // PORTABLE_COMPACT_UI_PREF_INIT\n  InitializePortableCompactUiPref();\n"
+        source = replace_once_or_present(source, anchor, addition, rel)
+    write_if_changed(path, path.read_text(encoding="utf-8"), source)
+
 def main() -> int:
     try:
         if len(sys.argv) != 2:
@@ -1392,8 +1600,9 @@ def main() -> int:
         apply_bookmark_scheme_colors(root)
         apply_data_ntp_exclusion(root)
         apply_bookmark_bar_autohide(root)
+        apply_portable_compact_ui_settings(root)
         print(
-            "Applied compact UI, native proactive discard, discarded-only hover-card "
+            "Applied toggleable compact UI, native proactive discard, discarded-only hover-card "
             "details, stable Task Manager ordering, bookmark URL styling, data-URL "
             "NTP filtering and optional bookmark-bar auto-hide."
         )
