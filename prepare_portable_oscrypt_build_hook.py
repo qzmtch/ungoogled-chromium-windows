@@ -13,6 +13,7 @@ HOOK_BLOCK = '''        # PORTABLE_OSCRYPT_POST_PATCH_HOOK
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_oscrypt.py'), str(source_tree)], check=True)
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_device_id.py'), str(source_tree)], check=True)
         subprocess.run([sys.executable, str(_ROOT_DIR / 'normalize_portable_layout_constants.py'), str(source_tree)], check=True)
+        subprocess.run([sys.executable, str(_ROOT_DIR / 'normalize_portable_ui_postprocessor.py'), str(_ROOT_DIR)], check=True)
         subprocess.run([sys.executable, str(_ROOT_DIR / 'apply_portable_ui_features.py'), str(source_tree)], check=True)
         subprocess.run([sys.executable, str(_ROOT_DIR / 'fix_portable_ui_compiler.py'), str(source_tree)], check=True)
 '''
@@ -35,6 +36,7 @@ def main() -> int:
             root / "apply_portable_oscrypt.py",
             root / "apply_portable_device_id.py",
             root / "normalize_portable_layout_constants.py",
+            root / "normalize_portable_ui_postprocessor.py",
             root / "apply_portable_ui_features.py",
             root / "fix_portable_ui_compiler.py",
         ]
@@ -57,7 +59,7 @@ def main() -> int:
             build_py.write_text(source, encoding="utf-8", newline="\n")
             print(
                 "Updated post-patch hook: OSCrypt, device-ID, layout-anchor normalization, "
-                "portable UI, then Chromium 141 UI compile fixes."
+                "UI post-processor anchor compatibility, portable UI, then Chromium 141 UI compile fixes."
             )
             return 0
 
@@ -70,7 +72,7 @@ def main() -> int:
         build_py.write_text(source, encoding="utf-8", newline="\n")
         print(
             "Installed post-patch hook: OSCrypt, device-ID, layout-anchor normalization, "
-            "portable UI, then Chromium 141 UI compile fixes."
+            "UI post-processor anchor compatibility, portable UI, then Chromium 141 UI compile fixes."
         )
         return 0
     except Exception as exc:
